@@ -76,6 +76,7 @@
 #include "core/hle/service/nx2_image_layout.h"
 #include "core/hle/service/nx2_video_input_queue.h"
 #include "core/hle/service/nx2_present_pacer.h"
+#include "core/hle/service/nx2_present_queue.h"
 #include "core/hle/service/nx2_video_ready.h"
 #include "core/hle/service/sm/sm.h"
 #include "core/hle/service/server_manager.h"
@@ -1724,6 +1725,10 @@ public:
     }
 
     ~INx2Vi2Session() override {
+        if (m_release_queue) {
+            m_release_queue.reset();
+            NvdrvSyncpoints().FreeSyncpoint(m_release_syncpoint);
+        }
         // The vsync callback may be running on the HostTiming thread: empty its event list under
         // its lock first (it holds the state, not this session), then close the events.
         {
@@ -1744,8 +1749,8 @@ private:
     }
 
     // 229(u64 client token, u32 slot, u32 image, ...fences): result, u64 mask of buffer slots the
-    // client may acquire next, four zero words. Nothing is shown yet; every slot is handed back
-    // at once (changes.patch's default mask is 0x7fff).
+    // client may acquire next, and this buffer's release fence. Every slot is handed back at
+    // once (changes.patch's default mask is 0x7fff); the release fence paces the game instead.
     void PresentClientBuffer(HLERequestContext& ctx) {
         Common::Nx2Timeline::OnPresent();
         // The frame boundary of tools/nx2/critical_path.py; "frame" is this present's number.
@@ -1812,9 +1817,19 @@ private:
         m_previous_fence_id = ~w[22];
         m_previous_fence_value = w[24];
         const auto waited = std::chrono::steady_clock::now();
+        const auto* process = ctx.GetThread().GetOwnerProcess();
+        const auto release = PresentQueue() ? QueueRelease(w[12], process, ~w[22], w[24])
+                                            : std::optional{std::array<u32, 4>{}};
+        if (!release) {
+            IPC::ResponseBuilder rb{ctx, 2};
+            rb.PushRaw<u32>(Kernel::ResultOutOfResource.raw);
+            return;
+        }
         Composite(w[5], ~w[22], w[24], w[7]);
         const auto composited = std::chrono::steady_clock::now();
-        PaceToVblank(w[12], ctx.GetThread().GetOwnerProcess());
+        if (!PresentQueue()) {
+            PaceToVblank(w[12], process);
+        }
         const auto paced = std::chrono::steady_clock::now();
         if (Common::DkbFrameTrace::Enabled()) {
             const auto ms = [](auto duration) {
@@ -1880,8 +1895,57 @@ private:
         }
         constexpr u64 AvailableSlots = 0x7fff;
         TipcReplyWords(ctx, {static_cast<u32>(AvailableSlots),
-                             static_cast<u32>(AvailableSlots >> 32), 0, 0, 0, 0});
+                             static_cast<u32>(AvailableSlots >> 32), (*release)[0], (*release)[1],
+                             (*release)[2], (*release)[3]});
     }
+
+    /// Whether presents return a release fence instead of holding the present thread until the
+    /// vblank, as the console's compositor does. A game times its CPU frame across the present
+    /// call, so a wait there reads as a slow CPU frame: Mario Kart World and Wonder NS2E then
+    /// chose their 30 fps mode and stayed there. EDEN_NX2_PRESENT_QUEUE=0 restores blocking pacing.
+    static bool PresentQueue() {
+        static const bool enabled = [] {
+            const char* value = std::getenv("EDEN_NX2_PRESENT_QUEUE");
+            return value == nullptr || value[0] != '0';
+        }();
+        return enabled;
+    }
+
+    Nvidia::NvCore::SyncpointManager& NvdrvSyncpoints() {
+        return system.ServiceManager()
+            .GetService<Nvidia::NVDRV>("nvdrv", true)
+            ->GetModule()
+            ->GetContainer()
+            .GetSyncpointManager();
+    }
+
+    /// Returns {~syncpoint, 0, value, 0}, released once this present's vblank deadline and its
+    /// frame's GPU fence have passed, or no fence when the syncpoint pool or queue is exhausted.
+    std::optional<std::array<u32, 4>> QueueRelease(u32 timing, const Kernel::KProcess* process,
+                                                   u32 fence_id, u32 fence_value) {
+        if (!m_release_queue) {
+            const auto id = NvdrvSyncpoints().TryAllocateSyncpoint(true);
+            if (!id) {
+                return std::nullopt;
+            }
+            m_release_syncpoint = *id;
+            m_release_queue.emplace(system.CoreTiming(), system.Host1x().GetSyncpointManager(), *id);
+            LOG_INFO(Service, "nx2:vi2 display release syncpoint {}", m_release_syncpoint);
+        }
+        const auto interval = PresentInterval(timing, process).value_or(std::chrono::nanoseconds{});
+        const auto now = system.CoreTiming().GetGlobalTimeNs();
+        m_release_time = interval.count() == 0 ? now : (std::max)(now, m_release_time);
+        const auto value = m_release_queue->Queue(m_release_time, fence_id, fence_value);
+        if (!value) {
+            return std::nullopt;
+        }
+        m_release_time += interval;
+        return std::array<u32, 4>{~m_release_syncpoint, 0, *value, 0};
+    }
+
+    u32 m_release_syncpoint{~0U};
+    std::chrono::nanoseconds m_release_time{};
+    std::optional<Nx2PresentReleaseQueue> m_release_queue;
 
     // The console's compositor frees a buffer only once its frame's GPU fence has passed, which
     // is what keeps a game from running ahead of the GPU. This reply always reports every buffer
@@ -1918,8 +1982,10 @@ private:
     // timing: present word 12, (swap interval << 16) | refresh rate. Fire Emblem: Fortune's Weave
     // sends 0x1003c during its boot logos and 0x2003c (two vblanks per frame, 30 fps) after; paced
     // at every vblank it ran at double speed. EDEN_NX2_SWAP_INTERVAL=<n> forces the interval.
-    void PaceToVblank(u32 timing, const Kernel::KProcess* process) {
-        Common::Nx2Timeline::Span timeline_span{"present: pace to vblank"};
+    // Returns the interval this present's word asks for between presents, or nothing when
+    // presents aren't paced (no speed limit).
+    std::optional<std::chrono::nanoseconds> PresentInterval(u32 timing,
+                                                            const Kernel::KProcess* process) {
         const bool trace = Common::DkbFrameTrace::Enabled();
         if (trace) {
             if (m_frame_trace.previous_word && *m_frame_trace.previous_word != timing) {
@@ -1962,7 +2028,7 @@ private:
         }
         if (!Settings::values.use_speed_limit.GetValue() || Settings::SpeedLimit() == 0) {
             VideoCommon::Nx2Perf::g_guest_frame_interval_ns.store(0, std::memory_order_relaxed);
-            return;
+            return std::nullopt;
         }
         if (timing != std::exchange(m_swap_word, timing)) {
             LOG_INFO(Service, "nx2:vi2 present #{} swap interval {} at {} Hz (word 12 = {:#x})",
@@ -1990,12 +2056,23 @@ private:
         if (trace) {
             m_frame_trace.target_ms = std::chrono::duration<double, std::milli>(interval).count();
         }
+        return interval;
+    }
+
+    /// Holds this present until its PresentInterval deadline.
+    void PaceToVblank(u32 timing, const Kernel::KProcess* process) {
+        Common::Nx2Timeline::Span timeline_span{"present: pace to vblank"};
+        const auto interval = PresentInterval(timing, process);
+        if (!interval) {
+            return;
+        }
+        const bool trace = Common::DkbFrameTrace::Enabled();
         const auto now = std::chrono::steady_clock::now();
-        auto pacing = m_present_pacer.Advance(now, interval);
+        auto pacing = m_present_pacer.Advance(now, *interval);
         if (trace) {
             m_frame_trace.deadline_reset = pacing.reset;
         }
-        AlignPhaseToDisplay(interval, now, pacing.deadline);
+        AlignPhaseToDisplay(*interval, now, pacing.deadline);
         if (now < pacing.deadline) {
             // Sleep this service thread in the guest kernel. It runs on guest core 3, and a host
             // sleep held that core for the whole wait: game threads scheduled there ran only
@@ -2307,7 +2384,10 @@ private:
         system.GPU().RequestComposite(std::move(layers), std::move(fences));
         CaptureFrame();
         DumpRanges();
-        system.SpeedLimiter().DoSpeedLimiting(system.CoreTiming().GetGlobalTimeUs());
+        // With release fences pacing the game, limiting here would hold the present thread again.
+        if (!PresentQueue()) {
+            system.SpeedLimiter().DoSpeedLimiting(system.CoreTiming().GetGlobalTimeUs());
+        }
         system.GetPerfStats().EndSystemFrame();
         system.GetPerfStats().BeginSystemFrame();
     }
