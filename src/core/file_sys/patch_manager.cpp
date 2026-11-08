@@ -14,10 +14,8 @@
 #include "common/hex_util.h"
 #include "common/logging.h"
 #include "common/settings.h"
-#ifndef _WIN32
 #include "common/string_util.h"
 #include "common/zstd_compression.h"
-#endif
 
 #include "core/core.h"
 #include "core/file_sys/common_funcs.h"
@@ -167,7 +165,7 @@ VirtualDir FindSubdirectoryCaseless(const VirtualDir dir, std::string_view name)
 #else
     const auto subdirs = dir->GetSubdirectories();
     for (const auto& subdir : subdirs) {
-        std::string dir_name = ::Common::ToLower(subdir->GetName());
+        std::string dir_name = Common::ToLower(subdir->GetName());
         if (dir_name == name) {
             return subdir;
         }
@@ -765,7 +763,7 @@ bool UltrawideModEnabled(const std::vector<VirtualDir>& patch_dirs,
         return false;
     }
     for (const auto& subdir : patch_dirs) {
-        const std::string name = ::Common::ToLower(subdir->GetName());
+        const std::string name = Common::ToLower(subdir->GetName());
         if (name.find("ultrawide") != std::string::npos &&
             name.find("3440x1440") != std::string::npos &&
             std::find(disabled.cbegin(), disabled.cend(), subdir->GetName()) == disabled.cend() &&
