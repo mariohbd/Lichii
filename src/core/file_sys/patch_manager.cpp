@@ -167,7 +167,7 @@ VirtualDir FindSubdirectoryCaseless(const VirtualDir dir, std::string_view name)
 #else
     const auto subdirs = dir->GetSubdirectories();
     for (const auto& subdir : subdirs) {
-        std::string dir_name = Common::ToLower(subdir->GetName());
+        std::string dir_name = ::Common::ToLower(subdir->GetName());
         if (dir_name == name) {
             return subdir;
         }
@@ -765,7 +765,7 @@ bool UltrawideModEnabled(const std::vector<VirtualDir>& patch_dirs,
         return false;
     }
     for (const auto& subdir : patch_dirs) {
-        const std::string name = Common::ToLower(subdir->GetName());
+        const std::string name = ::Common::ToLower(subdir->GetName());
         if (name.find("ultrawide") != std::string::npos &&
             name.find("3440x1440") != std::string::npos &&
             std::find(disabled.cbegin(), disabled.cend(), subdir->GetName()) == disabled.cend() &&
@@ -781,7 +781,7 @@ VirtualDir UltrawideHudLayer(const VirtualDir& romfs) {
     const auto archive = romfs->GetFileRelative(Uw::LayoutArchivePath);
     const auto pack = romfs->GetFileRelative(Uw::DictionaryPackPath);
     const auto pack_data =
-        pack ? Common::Compression::TryDecompressDataZSTD(pack->ReadAllBytes(), 64ULL << 20)
+        pack ? ::Common::Compression::TryDecompressDataZSTD(pack->ReadAllBytes(), 64ULL << 20)
              : std::nullopt;
     const auto dictionary =
         pack_data ? Uw::SarcFile(*pack_data, Uw::LayoutDictionaryName) : std::nullopt;
