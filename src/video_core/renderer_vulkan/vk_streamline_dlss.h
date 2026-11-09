@@ -8,6 +8,7 @@
 
 #include <array>
 #include <atomic>
+#include <optional>
 
 #include "common/common_types.h"
 #include "video_core/vulkan_common/vulkan_wrapper.h"
@@ -41,6 +42,8 @@ public:
         bool reset;
         bool depth_inverted = true;
         bool hdr = true; ///< Linear HDR colour. False for tonemapped, perceptually encoded colour.
+        /// R16F at the render size: 1 where DLSS should use this frame's colour instead of history.
+        std::optional<Image> bias_current_color;
     };
 
     /// Throws vk::Exception when Streamline has no DLSS for this device.
@@ -74,6 +77,7 @@ private:
     Scheduler& scheduler;
     MemoryAllocator& memory_allocator;
     void* set_options{}; ///< slDLSSSetOptions
+    void* get_state{};   ///< slDLSSGetState
     VkExtent2D render_extent{};
     VkExtent2D upscale_extent{};
     bool hdr_input = true;
@@ -82,6 +86,7 @@ private:
     vk::ImageView output_view;
     vk::Sampler point_sampler;
     std::atomic<bool> failed{};
+    std::atomic<bool> vram_warned{};
 };
 
 } // namespace Vulkan

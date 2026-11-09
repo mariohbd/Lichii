@@ -133,10 +133,13 @@ add_executable(tests
     core/thread_startup_policy.cpp
     core/nup_writer.cpp
     core/nup_metadata.cpp
+    core/nup_read_bench.cpp
+    core/nup_zstd_read.cpp
     core/nx2_image_layout.cpp
     core/nx2_video_input_queue.cpp
     core/ldn.cpp
     core/internal_network/socket_proxy.cpp
+    core/nx2_present_queue.cpp
     core/priority_queue.cpp
     core/internal_network/network.cpp
     video_core/memory_tracker.cpp
@@ -155,6 +158,7 @@ add_executable(tests
     video_core/ampere_uniform_immediate_shift.cpp
     video_core/ampere_bindless_surfaces.cpp
     video_core/native_macro_fifo.cpp
+    video_core/turing_macro_ram.cpp
     video_core/uniform_stream_reuse.cpp
     video_core/usage_tracker.cpp
     video_core/shader_invalidation.cpp

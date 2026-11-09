@@ -10,14 +10,14 @@
 #include <cstddef>
 #include <cstdlib>
 #include <cstring>
+#include <optional>
 
 #include "common/assert.h"
 #include "common/hex_util.h"
 #include "common/logging.h"
 #include "common/settings.h"
-#ifndef _WIN32
 #include "common/string_util.h"
-#endif
+#include "common/zstd_compression.h"
 
 #include "core/core.h"
 #include "core/file_sys/common_funcs.h"
@@ -36,6 +36,7 @@
 #include "core/loader/loader.h"
 #include "core/loader/nso.h"
 #include "core/memory/cheat_engine.h"
+#include "core/oot_ultrawide_hud.h"
 
 namespace FileSys {
 namespace {
@@ -65,12 +66,14 @@ struct BuiltinPatch {
     /// When set, the patch applies only while this environment variable is 1 (A/B before it
     /// becomes a default).
     const char* enable_env = nullptr;
-    /// When set, the patch is skipped while this environment variable starts with 0 (a default
-    /// that can be turned off).
+    /// When set, the patch applies unless this environment variable starts with 0.
     const char* disable_env = nullptr;
+    /// When set, the patch applies only with this NVIDIA DLSS mode chosen and is not listed in
+    /// Add-Ons.
+    std::optional<Settings::OcarinaDlssMode> render_scale{};
 };
 
-/// Whether a built-in patch's environment switches leave it on.
+/// Whether the environment switches of a built-in patch let it apply.
 bool BuiltinPatchSwitchedOn(const BuiltinPatch& patch) {
     if (patch.enable_env != nullptr) {
         const char* const value = std::getenv(patch.enable_env);
@@ -97,6 +100,32 @@ constexpr std::array MAX_RESOLUTION_RECORDS{
                        .original = 0x360041E8}, // tbz w8, #0, 0x80640c
 };
 
+// Render scale for "NVIDIA DLSS mode in Ocarina of Time", on top of Max Resolution: its
+// fixed-scale path returns 1.0 of 2560x1440 (main+0x806420: mov w9, #0x3f800000). Quality keeps
+// it; the other modes load a lower scale.
+constexpr u32 RENDER_SCALE_ONE = 0x52A7F009;                                  // #0x3f800000, 1.0
+constexpr std::array<u8, 4> RENDER_SCALE_BALANCED{0xE9, 0xEB, 0xA7, 0x52};    // #0x3f5f0000, ~1254p
+constexpr std::array<u8, 4> RENDER_SCALE_PERFORMANCE{0x09, 0xE8, 0xA7, 0x52}; // #0x3f400000, 1080p
+constexpr std::array<u8, 4> RENDER_SCALE_ULTRA{0x09, 0xE0, 0xA7, 0x52};       // #0x3f000000, 720p
+constexpr std::array RENDER_BALANCED_RECORDS{
+    BuiltinPatchRecord{.module_offset = 0x806420,
+                       .bytes = RENDER_SCALE_BALANCED,
+                       .checked = true,
+                       .original = RENDER_SCALE_ONE},
+};
+constexpr std::array RENDER_PERFORMANCE_RECORDS{
+    BuiltinPatchRecord{.module_offset = 0x806420,
+                       .bytes = RENDER_SCALE_PERFORMANCE,
+                       .checked = true,
+                       .original = RENDER_SCALE_ONE},
+};
+constexpr std::array RENDER_ULTRA_RECORDS{
+    BuiltinPatchRecord{.module_offset = 0x806420,
+                       .bytes = RENDER_SCALE_ULTRA,
+                       .checked = true,
+                       .original = RENDER_SCALE_ONE},
+};
+
 // Dynamic FPS by Dark (Eglantine Dev), bundled with his permission: the game's frame step follows
 // the time measured with the system counter instead of assuming 30 fps, so it runs at full speed
 // at any frame rate. A call (bl 0x3c46200) to a routine in unused space after the code.
@@ -116,27 +145,6 @@ constexpr std::array<u8, 120> DYNAMIC_FPS_ROUTINE{
 constexpr std::array DYNAMIC_FPS_RECORDS{
     BuiltinPatchRecord{.module_offset = 0x6E6CC4, .bytes = DYNAMIC_FPS_CALL},
     BuiltinPatchRecord{.module_offset = 0x3C46200, .bytes = DYNAMIC_FPS_ROUTINE},
-};
-
-// Texture pool for Max Resolution (PantACRO4life e3f36e0ee6, Castle Town pot room freeze #247):
-// with its full-screen targets kept at full size, the game's agl::utl::DynamicTextureAllocator
-// (305 MiB, ~288 usable) runs out where many local shadow maps are near; the game frees the block
-// it got back from the failed Allocate, which corrupts the allocator. Where the allocator is made
-// (stp x8, x9, [sp, #0x10] at main+0xC2A36C, x8 = its size) a branch to the code cave after the
-// Dynamic FPS routine doubles x8 (add x8, x8, x8), stores as before and branches back. Only the
-// guest pool grows: host images follow what is used.
-constexpr std::array<u8, 4> TEXTURE_POOL_BRANCH{0xD5, 0x6F, 0xC0, 0x14}; // b 0x3c462c0
-constexpr std::array<u8, 4> TEXTURE_POOL_DOUBLE{0x08, 0x01, 0x08, 0x8B}; // add x8, x8, x8
-constexpr std::array<u8, 4> TEXTURE_POOL_STORE{0xE8, 0x27, 0x01, 0xA9};  // stp x8, x9, [sp, #0x10]
-constexpr std::array<u8, 4> TEXTURE_POOL_RETURN{0x2A, 0x90, 0x3F, 0x17}; // b 0xc2a370
-constexpr std::array TEXTURE_POOL_RECORDS{
-    BuiltinPatchRecord{.module_offset = 0xC2A36C,
-                       .bytes = TEXTURE_POOL_BRANCH,
-                       .checked = true,
-                       .original = 0xA90127E8}, // stp x8, x9, [sp, #0x10]
-    BuiltinPatchRecord{.module_offset = 0x3C462C0, .bytes = TEXTURE_POOL_DOUBLE, .checked = true, .original = 0},
-    BuiltinPatchRecord{.module_offset = 0x3C462C4, .bytes = TEXTURE_POOL_STORE, .checked = true, .original = 0},
-    BuiltinPatchRecord{.module_offset = 0x3C462C8, .bytes = TEXTURE_POOL_RETURN, .checked = true, .original = 0},
 };
 
 // Occlusion Off (cLohan's community patch, from zortos293/Lichii#641): the game creates no
@@ -169,6 +177,26 @@ constexpr std::array POLL_BACKOFF_RECORDS{
     BuiltinPatchRecord{.module_offset = 0x1708C, .bytes = POLL_BACKOFF_RETURN, .checked = true, .original = 0},
 };
 
+// RsMan-Dev's texture pool patch (#247): with Max Resolution the render targets outgrow the
+// graphics allocator's initial pool and the Castle Town guard house dereferences a null
+// allocation (main+0x403f0). stp x8, x9, [sp, #0x10] at main+0xC2A36C stores the initial pool
+// size (x8); it now calls a routine in the padding after the code (bl 0x3c462c0) that doubles it
+// first (lsl x8, x8, #1 ; stp ; ret).
+constexpr std::array<u8, 4> TEXTURE_POOL_CALL{0xD5, 0x6F, 0xC0, 0x94};
+constexpr std::array<u8, 12> TEXTURE_POOL_ROUTINE{
+    0x08, 0xF9, 0x7F, 0xD3, 0xE8, 0x27, 0x01, 0xA9, 0xC0, 0x03, 0x5F, 0xD6,
+};
+constexpr std::array TEXTURE_POOL_RECORDS{
+    BuiltinPatchRecord{.module_offset = 0xC2A36C,
+                       .bytes = TEXTURE_POOL_CALL,
+                       .checked = true,
+                       .original = 0xA90127E8}, // stp x8, x9, [sp, #0x10]
+    BuiltinPatchRecord{.module_offset = 0x3C462C0,
+                       .bytes = TEXTURE_POOL_ROUTINE,
+                       .checked = true,
+                       .original = 0},
+};
+
 constexpr std::array BUILTIN_PATCHES{
     BuiltinPatch{
         .name = "Max Resolution (built-in)",
@@ -177,14 +205,30 @@ constexpr std::array BUILTIN_PATCHES{
         .build_id = "E0F3CCFAF50065AE4EA01EB5AEB13B1A45DA3348",
         .records = MAX_RESOLUTION_RECORDS,
     },
-    // Not tied to Max Resolution's record, so it also holds when that comes from a mod.
+    // Lower render scales under Max Resolution, chosen by Settings ocarina_dlss_mode.
     BuiltinPatch{
-        .name = "Texture pool for Max Resolution (built-in, EDEN_NX2_OOT_TEX_POOL_2X=0 off)",
+        .name = "DLSS Balanced render scale (built-in)",
         .title_id = 0x0400486024DEC000,
         .module = "main",
         .build_id = "E0F3CCFAF50065AE4EA01EB5AEB13B1A45DA3348",
-        .records = TEXTURE_POOL_RECORDS,
-        .disable_env = "EDEN_NX2_OOT_TEX_POOL_2X",
+        .records = RENDER_BALANCED_RECORDS,
+        .render_scale = Settings::OcarinaDlssMode::Balanced,
+    },
+    BuiltinPatch{
+        .name = "DLSS Performance render scale (built-in)",
+        .title_id = 0x0400486024DEC000,
+        .module = "main",
+        .build_id = "E0F3CCFAF50065AE4EA01EB5AEB13B1A45DA3348",
+        .records = RENDER_PERFORMANCE_RECORDS,
+        .render_scale = Settings::OcarinaDlssMode::Performance,
+    },
+    BuiltinPatch{
+        .name = "DLSS Ultra Performance render scale (built-in)",
+        .title_id = 0x0400486024DEC000,
+        .module = "main",
+        .build_id = "E0F3CCFAF50065AE4EA01EB5AEB13B1A45DA3348",
+        .records = RENDER_ULTRA_RECORDS,
+        .render_scale = Settings::OcarinaDlssMode::UltraPerformance,
     },
     BuiltinPatch{
         .name = "Dynamic FPS by Dark (built-in)",
@@ -208,6 +252,15 @@ constexpr std::array BUILTIN_PATCHES{
         .build_id = "E0F3CCFAF50065AE4EA01EB5AEB13B1A45DA3348",
         .records = POLL_BACKOFF_RECORDS,
         .enable_env = "EDEN_NX2_OOT_POLL_BACKOFF",
+    },
+    // EDEN_NX2_OOT_GUARDHOUSE_FIX=0 leaves the initial pool as the game sizes it.
+    BuiltinPatch{
+        .name = "Texture Pool x2 (built-in)",
+        .title_id = 0x0400486024DEC000,
+        .module = "main",
+        .build_id = "E0F3CCFAF50065AE4EA01EB5AEB13B1A45DA3348",
+        .records = TEXTURE_POOL_RECORDS,
+        .disable_env = "EDEN_NX2_OOT_GUARDHOUSE_FIX",
     },
 };
 
@@ -637,6 +690,17 @@ std::vector<u8> PatchManager::PatchNSO(const std::vector<u8>& nso, const std::st
         if (!BuiltinPatchSwitchedOn(patch)) {
             continue;
         }
+        if (patch.render_scale) {
+#ifdef EGLANTINE_STREAMLINE
+            if (!Settings::values.nvidia_dlss.GetValue() ||
+                *patch.render_scale != Settings::values.ocarina_dlss_mode.GetValue()) {
+                continue;
+            }
+#else
+            // A shared config can carry the setting into a build without DLSS.
+            continue;
+#endif
+        }
         if (std::find(disabled.cbegin(), disabled.cend(), patch.name) != disabled.cend()) {
             LOG_INFO(Loader, "    - Skipping \"{}\": disabled in Add-Ons", patch.name);
             continue;
@@ -765,6 +829,84 @@ std::vector<Core::Memory::CheatEntry> PatchManager::CreateCheatList(const BuildI
     return out;
 }
 
+namespace {
+
+// Puts `data` at `path` (relative, '/'-separated) under `root`, creating the directories.
+void PlaceFile(VectorVfsDirectory& root, std::string_view path, std::vector<u8> data) {
+    VectorVfsDirectory* dir = &root;
+    size_t slash;
+    while ((slash = path.find('/')) != std::string_view::npos) {
+        const auto name = path.substr(0, slash);
+        auto sub = dir->GetSubdirectory(name);
+        if (sub == nullptr) {
+            auto created = std::make_shared<VectorVfsDirectory>(
+                std::vector<VirtualFile>{}, std::vector<VirtualDir>{}, std::string{name});
+            dir->AddDirectory(created);
+            sub = std::move(created);
+        }
+        dir = static_cast<VectorVfsDirectory*>(sub.get());
+        path.remove_prefix(slash + 1);
+    }
+    dir->AddFile(std::make_shared<VectorVfsFile>(std::move(data), std::string{path}));
+}
+
+/// Ocarina with Ivan0xFF's 3440x1440 ultrawide mod enabled (a load/ mod whose name holds
+/// "Ultrawide" and "3440x1440" and that patches the ExeFS): its HUD's edge anchors moved to the
+/// 21:9 screen's edges, as a RomFS layer (Lichii #831). EDEN_OOT_UW_HUD_EDGES=0 keeps the HUD in
+/// the centred 16:9.
+bool UltrawideModEnabled(const std::vector<VirtualDir>& patch_dirs,
+                         const std::vector<std::string>& disabled) {
+    // EDEN_NX2_OOT_HUD_EDGES=0 (or the source's name, EDEN_OOT_UW_HUD_EDGES=0) turns it off.
+    static const bool edges_enabled = [] {
+        for (const char* const name : {"EDEN_NX2_OOT_HUD_EDGES", "EDEN_OOT_UW_HUD_EDGES"}) {
+            const char* const value = std::getenv(name);
+            if (value != nullptr && value[0] == '0') {
+                return false;
+            }
+        }
+        return true;
+    }();
+    if (!edges_enabled) {
+        return false;
+    }
+    for (const auto& subdir : patch_dirs) {
+        const std::string name = Common::ToLower(subdir->GetName());
+        if (name.find("ultrawide") != std::string::npos &&
+            name.find("3440x1440") != std::string::npos &&
+            std::find(disabled.cbegin(), disabled.cend(), subdir->GetName()) == disabled.cend() &&
+            FindSubdirectoryCaseless(subdir, "exefs") != nullptr) {
+            return true;
+        }
+    }
+    return false;
+}
+
+VirtualDir UltrawideHudLayer(const VirtualDir& romfs) {
+    namespace Uw = Core::OotUltrawideHud;
+    const auto archive = romfs->GetFileRelative(Uw::LayoutArchivePath);
+    const auto pack = romfs->GetFileRelative(Uw::DictionaryPackPath);
+    const auto pack_data =
+        pack ? ::Common::Compression::TryDecompressDataZSTD(pack->ReadAllBytes(), 64ULL << 20)
+             : std::nullopt;
+    const auto dictionary =
+        pack_data ? Uw::SarcFile(*pack_data, Uw::LayoutDictionaryName) : std::nullopt;
+    auto anchored = archive && dictionary
+                        ? Uw::AnchorHudToEdges(archive->ReadAllBytes(), *dictionary)
+                        : std::nullopt;
+    if (!anchored) {
+        LOG_WARNING(Loader, "    RomFS: {} is not the layout archive the ultrawide HUD expects",
+                    Uw::LayoutArchivePath);
+        return nullptr;
+    }
+    LOG_INFO(Loader, "    RomFS: ultrawide HUD moves the HUD's edge anchors out by {} units",
+             Uw::EdgeShift);
+    auto layer = std::make_shared<VectorVfsDirectory>();
+    PlaceFile(*layer, Uw::LayoutArchivePath, std::move(*anchored));
+    return layer;
+}
+
+} // Anonymous namespace
+
 void PatchManager::ApplyLayeredFS(VirtualFile& romfs, ContentRecordType type) const {
     const auto load_dir = GetModificationLoadRoot();
     const auto sdmc_load_dir = GetModificationLoadRoot(true);
@@ -815,8 +957,12 @@ void PatchManager::ApplyLayeredFS(VirtualFile& romfs, ContentRecordType type) co
         }
     }
 
+    const bool ultrawide_hud = type == ContentRecordType::Program &&
+                               title_id == Core::OotUltrawideHud::ProgramId &&
+                               UltrawideModEnabled(patch_dirs, disabled);
+
     // When there are no layers to apply, return early as there is no need to rebuild the RomFS
-    if (layers.empty() && layers_ext.empty()) {
+    if (layers.empty() && layers_ext.empty() && !ultrawide_hud) {
         return;
     }
 
@@ -825,6 +971,13 @@ void PatchManager::ApplyLayeredFS(VirtualFile& romfs, ContentRecordType type) co
         return;
     }
 
+    if (ultrawide_hud) {
+        if (auto hud_layer = UltrawideHudLayer(extracted)) {
+            layers.emplace_back(std::move(hud_layer));
+        } else if (layers.empty() && layers_ext.empty()) {
+            return;
+        }
+    }
     layers.emplace_back(std::move(extracted));
 
     auto layered = LayeredVfsDirectory::MakeLayeredDirectory(std::move(layers));
@@ -1247,7 +1400,7 @@ std::vector<Patch> PatchManager::GetPatches(VirtualFile update_raw) const {
     }
 
     for (const auto& patch : BUILTIN_PATCHES) {
-        if (patch.title_id != title_id || !BuiltinPatchSwitchedOn(patch)) {
+        if (patch.title_id != title_id || !BuiltinPatchSwitchedOn(patch) || patch.render_scale) {
             continue;
         }
         const auto patch_disabled =
