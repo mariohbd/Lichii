@@ -128,6 +128,12 @@ void SetCurrentThreadToEfficiencyCores();
 void SetCurrentThreadToBackgroundWork();
 void SetCurrentThreadToAllCores();
 
+/// Windows: registers the calling thread with MMCSS's "Games" task (AvSetMmThreadCharacteristics)
+/// until it exits, so the Multimedia Class Scheduler raises it above the process's
+/// TIME_CRITICAL threads while it stays within the task's CPU budget. For short, deadline-bound
+/// threads (present, audio). No-op elsewhere, and with EDEN_NX2_MMCSS=0.
+void SetCurrentThreadToGamesMmcss();
+
 void RefreshThreadPolicies();
 void PollThreadPolicies();
 
