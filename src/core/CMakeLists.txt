@@ -17,6 +17,8 @@ add_library(core STATIC
     constants.h
     core.cpp
     core.h
+    oot_ultrawide_hud.cpp
+    oot_ultrawide_hud.h
     game_settings.cpp
     game_settings.h
     core_timing.cpp
