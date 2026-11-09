@@ -151,6 +151,10 @@ public:
     /// Keeps `image` (GPU work on it done, `bytes` of device memory) for TakePooledImage.
     void PoolImage(const ImagePoolKey& key, vk::Image image, u64 bytes);
 
+    /// Frees `image` once the GPU has finished what was recorded so far
+    /// (EDEN_NX2_RSMAN_VRAM_FREE_ORIGINAL).
+    void DestroyWhenIdle(vk::Image&& image);
+
     /// Device memory the pool holds: counted by the driver, not by the texture cache.
     [[nodiscard]] u64 PooledImageBytes() const noexcept {
         return image_pool_bytes;
@@ -379,6 +383,8 @@ public:
         vk::Buffer bridge;
     };
     std::deque<PendingByteAddressedShadow> pending_byte_addressed_shadows;
+    /// DestroyWhenIdle's images, with the tick that must be done first.
+    std::deque<std::pair<u64, vk::Image>> images_to_destroy;
 
     /// EXP42's pool, oldest first. Capped at ImagePoolMaxBytes and ImagePoolMaxFrames of age,
     /// emptied when the switch goes off or images stop fitting in device memory.
@@ -539,7 +545,7 @@ public:
 
     /// No memory was left to make it: the texture cache drops it instead of using it.
     [[nodiscard]] bool OutOfMemory() const noexcept {
-        return !original_image && info.type != VideoCommon::ImageType::Buffer;
+        return !original_image && !original_pending && info.type != VideoCommon::ImageType::Buffer;
     }
 
     void UploadMemory(VkBuffer buffer, VkDeviceSize offset,
@@ -560,7 +566,7 @@ public:
     void AllocateComputeUnswizzleImage();
 
     [[nodiscard]] VkImage Handle() const noexcept {
-        return *(this->*current_image);
+        return *CurrentImage();
     }
 
     [[nodiscard]] VkImageAspectFlags AspectMask() const noexcept {
@@ -568,12 +574,24 @@ public:
     }
 
     [[nodiscard]] VkImageUsageFlags UsageFlags() const noexcept {
-        return (this->*current_image).UsageFlags();
+        return CurrentImage().UsageFlags();
     }
 
     /// Where the image's memory lies, for the collector (TextureCache::RunGarbageCollector).
+    /// The scaled image's while the unscaled one is not made.
     [[nodiscard]] vk::Image::MemoryBlock MemoryBlock() const noexcept {
-        return original_image.GetMemoryBlock();
+        return original_image || !scaled_image ? original_image.GetMemoryBlock()
+                                               : scaled_image.GetMemoryBlock();
+    }
+
+    /// EDEN_NX2_RSMAN_VRAM_LAZY_ORIGINAL: goes straight to the scaled image of a scaled_only image,
+    /// with the unscaled one made only if something asks for it. False for other images.
+    bool StartScaled();
+
+    /// True while the unscaled image of a scaled image is not made (EDEN_NX2_RSMAN_VRAM_*): it
+    /// has no memory then.
+    [[nodiscard]] bool OriginalPending() const noexcept {
+        return original_pending;
     }
 
     /// EXP42: whether the image took a pooled VkImage (the slow clear log counts them).
@@ -642,6 +660,17 @@ private:
     bool BlitScaleHelper(bool scale_up);
 
     bool NeedsScaleHelper() const;
+
+    /// The image current_image selects, making the unscaled image first when it is pending.
+    [[nodiscard]] const vk::Image& CurrentImage() const {
+        if (current_image == &Image::original_image && original_pending) {
+            const_cast<Image*>(this)->OriginalImage();
+        }
+        return this->*current_image;
+    }
+
+    /// The unscaled image, made on first use while it is pending (EDEN_NX2_RSMAN_VRAM_*).
+    vk::Image& OriginalImage();
 
     Scheduler* scheduler{};
     TextureCacheRuntime* runtime{};
@@ -740,6 +769,13 @@ private:
     ImagePoolKey scaled_pool_key;
     bool from_pool = false; ///< original_image came from the pool
 
+    /// EDEN_NX2_RSMAN_VRAM_LAZY_ORIGINAL (zortos293/Lichii#267): the unscaled image of a
+    /// scaled_only image is not made yet; OriginalImage() makes it. Declared before it: its
+    /// initializer reads this.
+    bool original_pending = false;
+    /// EDEN_NX2_RSMAN_VRAM_FREE_ORIGINAL: the unscaled image can be made again from nothing but
+    /// the create info, so it is freed once the scaled image holds the contents.
+    bool original_releasable = false;
     vk::Image original_image;
     vk::Image scaled_image;
 

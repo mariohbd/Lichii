@@ -37,6 +37,7 @@
 #include "video_core/texture_cache/image_view_base.h"
 #include "video_core/texture_cache/conversion.h"
 #include "video_core/texture_cache/samples_helper.h"
+#include "video_core/texture_cache/rsman_vram.h"
 #include "video_core/texture_cache/texture_cache_base.h"
 #include "video_core/texture_cache/util.h"
 #include "video_core/nx2.h"
@@ -1457,6 +1458,80 @@ bool TextureCache<P>::RescaleRenderTargets() {
 }
 
 template <class P>
+void TextureCache<P>::ResolveDeferredRtRefreshes() {
+    if (deferred_rt_refreshes.empty()) {
+        return;
+    }
+    const auto& regs = maxwell3d->regs;
+    const auto& clear = regs.clear_surface;
+    const auto is_deferred = [this](ImageId id) {
+        return std::ranges::find(deferred_rt_refreshes, id) != deferred_rt_refreshes.end();
+    };
+    // Whether the clear writes every texel of the view's image: IsFullClear (the scissor), and
+    // the render area the clear is clamped to (the smallest bound target).
+    const auto clear_covers = [&](ImageViewId view_id) {
+        const ImageInfo& info = slot_images[slot_image_views[view_id].image_id].info;
+        if (clear.layer != 0 || info.type != ImageType::e2D || info.resources.levels != 1 ||
+            info.resources.layers != 1 || info.num_samples != 1 || !IsFullClear(view_id)) {
+            return false;
+        }
+        const u32 width = info.size.width;
+        const u32 height = info.size.height;
+        for (u32 index = 0; index < regs.rt_control.count && index < NUM_RT; ++index) {
+            const auto& rt = regs.rt[index];
+            if (rt.Address() != 0 && rt.format != Tegra::RenderTargetFormat::NONE &&
+                (rt.width < width || rt.height < height)) {
+                return false;
+            }
+        }
+        return !(regs.zeta_enable && regs.zeta.Address() != 0 &&
+                 (regs.zeta_size.width < width || regs.zeta_size.height < height));
+    };
+    // Only a target this clear really overwrites may skip its upload: IsFullClear looks at the
+    // area, not at which target and channels the clear selects. The others are uploaded now, with
+    // their alias copies (JoinImages left those out): PrepareImage skips them when IsFullClear
+    // makes it invalidate the image (zortos293/Lichii#267, RsMan-Dev c724c2e9c9 + 4c5fccc93c).
+    const auto restore = [this](ImageId image_id) {
+        Image& image = slot_images[image_id];
+        RefreshContents(image, image_id);
+        if (!image.aliased_images.empty()) {
+            SynchronizeAliases(image_id);
+        }
+    };
+    const bool all_channels = clear.R && clear.G && clear.B && clear.A;
+    for (size_t index = 0; index < NUM_RT; ++index) {
+        const ImageViewId view_id = render_targets.color_buffer_ids[index];
+        if (!view_id || slot_image_views[view_id].IsBuffer()) {
+            continue;
+        }
+        const ImageId image_id = slot_image_views[view_id].image_id;
+        if (!is_deferred(image_id)) {
+            continue;
+        }
+        // The clear writes attachment RT, which is target rt_control.Map(RT).
+        if (clear.RT != index || !all_channels || index >= regs.rt_control.count ||
+            regs.rt_control.Map(index) != index || !clear_covers(view_id)) {
+            restore(image_id);
+        }
+    }
+    const ImageViewId depth_id = render_targets.depth_buffer_id;
+    if (depth_id && !slot_image_views[depth_id].IsBuffer()) {
+        const ImageId image_id = slot_image_views[depth_id].image_id;
+        if (is_deferred(image_id)) {
+            const auto type = VideoCore::Surface::GetFormatType(slot_images[image_id].info.format);
+            const bool all_aspects =
+                (clear.Z || type == VideoCore::Surface::SurfaceType::Stencil) &&
+                (clear.S || type == VideoCore::Surface::SurfaceType::Depth) &&
+                (!clear.S || regs.stencil_front_mask == 0xFF);
+            if (!all_aspects || !clear_covers(depth_id)) {
+                restore(image_id);
+            }
+        }
+    }
+    deferred_rt_refreshes.clear();
+}
+
+template <class P>
 void TextureCache<P>::UpdateRenderTargets(bool is_clear) {
     using namespace VideoCommon::Dirty;
     struct ClearingScope {
@@ -1507,7 +1582,14 @@ void TextureCache<P>::UpdateRenderTargets(bool is_clear) {
     rt_prepared.valid = false;
 
     const VideoCommon::RenderTargets previous_render_targets = render_targets;
+    // EDEN_NX2_RSMAN_VRAM_RT_DEFER: new targets the clear binds are uploaded after it unless it
+    // overwrites them (ResolveDeferredRtRefreshes).
+    static const bool rt_defer = RsManVram::Enabled("EDEN_NX2_RSMAN_VRAM_RT_DEFER");
+    deferred_rt_refreshes.clear();
+    defer_rt_refresh = rt_defer && is_clear;
     const bool rescaled = RescaleRenderTargets();
+    defer_rt_refresh = false;
+    ResolveDeferredRtRefreshes();
     if (is_rescaling != rescaled) {
         flags[Dirty::RescaleViewports] = true;
         flags[Dirty::RescaleScissors] = true;
@@ -3246,6 +3328,12 @@ u64 TextureCache<P>::GetScaledImageSizeBytes(const ImageBase& image) {
 
 template <class P>
 u64 TextureCache<P>::ImageMemoryBytes(const Image& image) const {
+    if constexpr (requires { image.OriginalPending(); }) {
+        // EDEN_NX2_RSMAN_VRAM_*: an unscaled image not made (yet, or again) has no memory.
+        if (image.OriginalPending() && False(image.flags & ImageFlagBits::Unbacked)) {
+            return 0;
+        }
+    }
     if (True(image.flags & ImageFlagBits::Unbacked)) {
         // No device memory but what BindLayers gave a SparseLayers image: at its full size (GBs
         // for title 1's sparse terrain images), deleting it would look to the collector like
@@ -3781,6 +3869,16 @@ ImageId TextureCache<P>::JoinImages(const ImageInfo& info, GPUVAddr gpu_addr, DA
             }
         }
     }
+    // EDEN_NX2_RSMAN_VRAM_LAZY_ORIGINAL (zortos293/Lichii#267): a new render target with nothing
+    // to take from another image only ever uses its scaled image: its unscaled one was bound to
+    // memory for nothing and blitted from with no contents. It starts scaled, with the unscaled
+    // image made if something asks for it (an upload, a download, going back to 1x).
+    static const bool lazy_original = RsManVram::Enabled("EDEN_NX2_RSMAN_VRAM_LAZY_ORIGINAL");
+    new_info.scaled_only = lazy_original && inserting_render_target && new_info.rescaleable &&
+                           !new_info.is_sparse && new_info.type == ImageType::e2D &&
+                           new_info.num_samples == 1 &&
+                           Settings::values.resolution_info.active && join_copies_to_do.empty() &&
+                           !IsPixelFormatASTC(new_info.format) && !IsPixelFormatBCn(new_info.format);
     const auto create_start = std::chrono::steady_clock::now();
     const ImageId new_image_id = slot_images.insert(runtime, new_info, gpu_addr, cpu_addr);
     rt_stats.create_ns += NsSince(create_start);
@@ -3804,6 +3902,14 @@ ImageId TextureCache<P>::JoinImages(const ImageInfo& info, GPUVAddr gpu_addr, DA
     }
     Image& new_image = slot_images[new_image_id];
     ++bindings_epoch;
+    new_image.info.scaled_only = false; // read by the constructor only
+    bool started_scaled = false;
+    if constexpr (requires { new_image.StartScaled(); }) {
+        started_scaled = new_image.StartScaled();
+        if (started_scaled) {
+            total_used_memory += GetScaledImageSizeBytes(new_image);
+        }
+    }
 
     new_image.allocation_tick = frame_tick;
     {
@@ -3910,10 +4016,34 @@ ImageId TextureCache<P>::JoinImages(const ImageInfo& info, GPUVAddr gpu_addr, DA
         }
         return false;
     };
-    const bool clear_skip = overwritten_by_clear();
+    // EDEN_NX2_RSMAN_VRAM_RT_DEFER (zortos293/Lichii#267): a render target created while a clear
+    // binds its targets usually never needs its guest contents: leave it CpuModified,
+    // UpdateRenderTargets uploads it unless the clear overwrites all of it
+    // (ResolveDeferredRtRefreshes). Images that receive non-alias copies below must be uploaded
+    // first, or the upload would overwrite the copies. Alias copies can wait (the resolve runs
+    // them with the upload); overlaps merged into the image can't, they get deleted. Replaces
+    // overwritten_by_clear's skip, which needed no copies at all.
+    // EDEN_NX2_RSMAN_VRAM_OVER_GPU (zortos293/Lichii#267): a new render target over memory whose
+    // last contents only the GPU has (a GPU-written bad overlap) skips the upload: the guest
+    // bytes are stale, and a target newly placed in that memory has no defined contents anyway.
+    // Ocarina of Time places about 45 targets a frame at new addresses while the camera moves.
+    static const bool over_gpu_skip = RsManVram::Enabled("EDEN_NX2_RSMAN_VRAM_OVER_GPU");
+    const bool over_gpu_contents =
+        over_gpu_skip && inserting_render_target && join_copies_to_do.empty() &&
+        std::ranges::any_of(join_bad_overlap_ids, [this](ImageId overlap_id) {
+            return True(slot_images[overlap_id].flags & ImageFlagBits::GpuModified);
+        });
+    const bool deferred_refresh =
+        !over_gpu_contents && defer_rt_refresh &&
+        std::ranges::all_of(join_copies_to_do, [](const JoinCopy& copy) {
+            return copy.is_alias;
+        });
+    static const bool rt_defer = RsManVram::Enabled("EDEN_NX2_RSMAN_VRAM_RT_DEFER");
+    const bool clear_skip = !over_gpu_contents && !rt_defer && overwritten_by_clear();
     // EDEN_NX2_EXP8 bit 2: skip the upload the copies overwrite.
-    const bool copy_skip =
-        !clear_skip && (VideoCore::Nx2Debug::Experiment(8) & 2) != 0 && overwritten_by_copies();
+    const bool copy_skip = !over_gpu_contents && !clear_skip && !deferred_refresh &&
+                           (VideoCore::Nx2Debug::Experiment(8) & 2) != 0 &&
+                           overwritten_by_copies();
     if (VideoCore::Nx2Debug::Experiment(7) != 0 && new_image.guest_size_bytes >= 4_MiB)
         [[unlikely]] {
         // Why a large new image was (or was not) uploaded from guest memory.
@@ -3935,13 +4065,24 @@ ImageId TextureCache<P>::JoinImages(const ImageInfo& info, GPUVAddr gpu_addr, DA
                         new_info.resources.layers, new_image.gpu_addr, join_copies_to_do.size(),
                         aliases, gpu_written, join_bad_overlap_ids.size(),
                         clearing_render_targets, overwritten_by_copies(),
-                        clear_skip  ? "skipped (clear)"
-                        : copy_skip ? "skipped (copies)"
-                                    : "done");
+                        over_gpu_contents  ? "skipped (over GPU contents)"
+                        : clear_skip       ? "skipped (clear)"
+                        : deferred_refresh ? "deferred (clear)"
+                        : copy_skip        ? "skipped (copies)"
+                                           : "done");
         }
     }
     const auto refresh_start = std::chrono::steady_clock::now();
-    if (clear_skip) {
+    if (over_gpu_contents) {
+        new_image.flags &= ~ImageFlagBits::CpuModified;
+        if (False(new_image.flags & ImageFlagBits::Tracked)) {
+            TrackImage(new_image, new_image_id);
+        }
+        runtime.TransitionImageLayout(new_image);
+    } else if (deferred_refresh) {
+        deferred_rt_refreshes.push_back(new_image_id);
+        runtime.TransitionImageLayout(new_image);
+    } else if (clear_skip) {
         // Stays CpuModified: UpdateRenderTargets' PrepareImage drops the upload only when
         // IsFullClear agrees the clear covers the whole image, and uploads it otherwise.
         runtime.TransitionImageLayout(new_image);
@@ -3956,12 +4097,13 @@ ImageId TextureCache<P>::JoinImages(const ImageInfo& info, GPUVAddr gpu_addr, DA
     }
     rt_stats.refresh_ns += NsSince(refresh_start);
     if (!relocation_tombstones.empty()) {
-        CheckTombstoneCreation(new_image_id, new_image, clear_skip); // EXP43=4
+        // EXP43=4
+        CheckTombstoneCreation(new_image_id, new_image, clear_skip || over_gpu_contents);
     }
 
     if (can_rescale) {
         ScaleUp(new_image);
-    } else {
+    } else if (!started_scaled) {
         ScaleDown(new_image);
     }
 
@@ -4012,6 +4154,9 @@ ImageId TextureCache<P>::JoinImages(const ImageInfo& info, GPUVAddr gpu_addr, DA
     for (const auto& copy_object : join_copies_to_do) {
         Image& overlap = slot_images[copy_object.id];
         if (copy_object.is_alias) {
+            if (deferred_refresh) {
+                continue;
+            }
             if (!overlap.IsSafeGpuCopy()) {
                 continue;
             }
@@ -4249,6 +4394,17 @@ ImageViewId TextureCache<P>::FindDepthBuffer() {
         return ImageViewId{};
     }
     ImageInfo info(regs.zeta, regs.zeta_size, regs.anti_alias_samples_mode);
+    // EDEN_NX2_RSMAN_VRAM_SQUARE_DEPTH (zortos293/Lichii#267, #288): Ocarina of Time renders its
+    // shadow maps with the width aligned up to 16 (800x793), then samples them as the square
+    // texture they are (793x793) at the same address. Two images meant a copy between them for
+    // each new size, and these change every frame while the camera moves. A target of that
+    // shape really drawn wider than its height would be clipped.
+    static const bool square_depth = RsManVram::Enabled("EDEN_NX2_RSMAN_VRAM_SQUARE_DEPTH");
+    if (square_depth && info.format == VideoCore::Surface::PixelFormat::D32_FLOAT &&
+        info.type == ImageType::e2D && info.size.width != info.size.height &&
+        info.size.width == Common::AlignUp(info.size.height, 16U)) {
+        info.size.width = info.size.height;
+    }
     // A square depth target with no color target is a shadow map: its size doesn't set the output
     // resolution, and scaling it only multiplies its memory by the square of the scale (648 MiB for
     // Ocarina of Time's 12288x12288 sun shadow map at 1.5x). A full-screen depth prepass isn't square.
@@ -4284,7 +4440,9 @@ ImageViewId TextureCache<P>::FindRenderTargetView(const ImageInfo& info, GPUVAdd
     bool delete_state = has_deleted_images;
     do {
         has_deleted_images = false;
+        inserting_render_target = true;
         image_id = FindOrInsertImage(info, gpu_addr);
+        inserting_render_target = false;
         delete_state |= has_deleted_images;
     } while (has_deleted_images);
     has_deleted_images = delete_state;

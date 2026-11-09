@@ -43,6 +43,7 @@
 #include "video_core/renderer_vulkan/vk_staging_buffer_pool.h"
 #include "video_core/surface.h"
 #include "video_core/texture_cache/formatter.h"
+#include "video_core/texture_cache/rsman_vram.h"
 #include "video_core/texture_cache/samples_helper.h"
 #include "video_core/texture_cache/util.h"
 #include "video_core/dlss_contract.h"
@@ -1133,6 +1134,33 @@ void TryTransformSwizzleIfNeeded(PixelFormat format, std::array<SwizzleSource, 4
     }
     ASSERT_MSG(false, "Invalid image format={}", format);
     return VK_FORMAT_R32_UINT;
+}
+
+/// Moves a new image (no contents) to the GENERAL layout every image of the cache is used in.
+void RecordInitialLayout(Scheduler& scheduler, VkImage image, VkImageAspectFlags aspect_mask) {
+    const VkImageMemoryBarrier barrier{
+        .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+        .pNext = nullptr,
+        .srcAccessMask = VK_ACCESS_NONE,
+        .dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT,
+        .oldLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+        .newLayout = VK_IMAGE_LAYOUT_GENERAL,
+        .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+        .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+        .image = image,
+        .subresourceRange{
+            .aspectMask = aspect_mask,
+            .baseMipLevel = 0,
+            .levelCount = VK_REMAINING_MIP_LEVELS,
+            .baseArrayLayer = 0,
+            .layerCount = VK_REMAINING_ARRAY_LAYERS,
+        },
+    };
+    scheduler.RequestOutsideRenderPassOperationContext();
+    scheduler.Record([barrier](vk::CommandBuffer cmdbuf) {
+        cmdbuf.PipelineBarrier(vk::PIPELINE_STAGE_GRAPHICS_COMPUTE,
+                               vk::PIPELINE_STAGE_GRAPHICS_COMPUTE, 0, barrier);
+    });
 }
 
 void BlitScale(Scheduler& scheduler, VkImage src_image, VkImage dst_image, const ImageInfo& info,
@@ -2960,6 +2988,10 @@ void TextureCacheRuntime::PoolImage(const ImagePoolKey& key, vk::Image image, u6
     TrimImagePool(ImagePoolMaxBytes);
 }
 
+void TextureCacheRuntime::DestroyWhenIdle(vk::Image&& image) {
+    images_to_destroy.emplace_back(scheduler.CurrentTick(), std::move(image));
+}
+
 void TextureCacheRuntime::TrimImagePool(u64 max_bytes) {
     while (!image_pool.empty() && image_pool_bytes > max_bytes) {
         image_pool_bytes -= image_pool.front().bytes;
@@ -2969,6 +3001,9 @@ void TextureCacheRuntime::TrimImagePool(u64 max_bytes) {
 }
 
 void TextureCacheRuntime::TickFrame() {
+    while (!images_to_destroy.empty() && scheduler.IsFree(images_to_destroy.front().first)) {
+        images_to_destroy.pop_front();
+    }
     ++image_pool_frame;
     {
         // EXP42's pool: images older than ImagePoolMaxFrames go, and all of them when the
@@ -3046,7 +3081,12 @@ Image::Image(TextureCacheRuntime& runtime_, const ImageInfo& info_, GPUVAddr gpu
              VAddr cpu_addr_)
     : VideoCommon::ImageBase(info_, gpu_addr_, cpu_addr_), scheduler{&runtime_.scheduler},
       runtime{&runtime_},
-      original_image(MakeImage(runtime_.device, runtime_.memory_allocator,
+      // EDEN_NX2_RSMAN_VRAM_LAZY_ORIGINAL: JoinImages marks scaled_only only new 2D render
+      // targets with nothing to copy in; never one that would be unbacked or sparse.
+      original_pending(info_.scaled_only && !UsesSparseLayers(runtime_.device, info_, gpu_addr_) &&
+                       !UsesSparseTiles(runtime_.device, info_, gpu_addr_) &&
+                       !IsUnwrittenSparse(runtime_.device, info_, gpu_addr_)),
+      original_image(original_pending ? vk::Image{} : MakeImage(runtime_.device, runtime_.memory_allocator,
                                TrimmedHostInfo(runtime_.device, info, host_level_offset),
                                IsHugeAstcArray(runtime_.device, info) ||
                                        IsUnevenMipRgba8Astc(runtime_.device, info)
@@ -3065,6 +3105,17 @@ Image::Image(TextureCacheRuntime& runtime_, const ImageInfo& info_, GPUVAddr gpu
     if (OutOfMemory()) {
         return;
     }
+    // EDEN_NX2_RSMAN_VRAM_FREE_ORIGINAL (zortos293/Lichii#267): plain 2D images only, whose
+    // unscaled image OriginalImage() makes again the same way, and that scale without the helper
+    // (its cached views would keep the freed image).
+    static const bool free_original = VideoCommon::RsManVram::Enabled("EDEN_NX2_RSMAN_VRAM_FREE_ORIGINAL");
+    original_releasable =
+        free_original && (original_pending || (original_image && !original_image.IsUnbacked())) &&
+        info.type == ImageType::e2D && info.num_samples == 1 && info.resources.levels == 1 &&
+        !info.is_sparse && host_level_offset == 0 && !IsPixelFormatASTC(info.format) &&
+        !IsPixelFormatBCn(info.format) && !UsesSparseLayers(runtime_.device, info, gpu_addr_) &&
+        !UsesSparseTiles(runtime_.device, info, gpu_addr_) &&
+        !IsUnwrittenSparse(runtime_.device, info, gpu_addr_) && !NeedsScaleHelper();
     if (original_image.IsUnbacked()) {
         flags |= VideoCommon::ImageFlagBits::Unbacked;
         const ImageInfo host_info = TrimmedHostInfo(runtime_.device, info, host_level_offset);
@@ -3119,7 +3170,7 @@ Image::Image(TextureCacheRuntime& runtime_, const ImageInfo& info_, GPUVAddr gpu
         flags |= VideoCommon::ImageFlagBits::Converted;
         flags |= VideoCommon::ImageFlagBits::CostlyLoad;
     }
-    if (runtime->device.HasDebuggingToolAttached()) {
+    if (runtime->device.HasDebuggingToolAttached() && original_image) {
         original_image.SetObjectNameEXT(VideoCommon::Name(*this).c_str());
     }
     current_image = &Image::original_image;
@@ -3306,7 +3357,7 @@ void Image::UploadMemory(VkBuffer buffer, VkDeviceSize offset,
     scheduler->RequestOutsideRenderPassOperationContext();
     auto vk_copies = TransformBufferImageCopies(copies, offset, aspect_mask);
     const VkBuffer src_buffer = buffer;
-    const VkImage vk_image = *original_image;
+    const VkImage vk_image = *OriginalImage();
     const VkImageAspectFlags vk_aspect_mask = aspect_mask;
     const bool was_initialized = std::exchange(initialized, true);
 
@@ -3337,6 +3388,7 @@ void Image::DownloadMemory(VkBuffer buffer, size_t offset,
 
 void Image::DownloadMemory(std::span<VkBuffer> buffers_span, std::span<size_t> offsets_span,
                             std::span<const VideoCommon::BufferImageCopy> copies) {
+    OriginalImage();
     if (!original_image) {
         LOG_CRITICAL(Render_Vulkan, "Missing image at download: gpu={:#x}, cpu={:#x}, type={}, format={}, flags={:#x}, size={}, dimensions={}x{}",
                      gpu_addr, cpu_addr, static_cast<u32>(info.type), static_cast<u32>(info.format),
@@ -3506,7 +3558,7 @@ void Image::DownloadMemory(std::span<VkBuffer> buffers_span, std::span<size_t> o
                 TransformBufferImageCopies(copies, offsets_span[index], aspect_mask));
         }
         scheduler->RequestOutsideRenderPassOperationContext();
-        scheduler->Record([buffers = std::move(buffers_vector), image = *original_image,
+        scheduler->Record([buffers = std::move(buffers_vector), image = *OriginalImage(),
                            aspect_mask_ = aspect_mask, vk_copies](vk::CommandBuffer cmdbuf) {
             const VkImageMemoryBarrier read_barrier{
                 .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
@@ -4216,6 +4268,31 @@ bool Image::IsRescaled() const noexcept {
     return True(flags & ImageFlagBits::Rescaled);
 }
 
+vk::Image& Image::OriginalImage() {
+    if (!original_pending) {
+        return original_image;
+    }
+    original_pending = false;
+    // Only plain images get here (scaled_only, see the constructor): no sparse binding, no ASTC
+    // or BCn host format, nothing to name for a debugger that was not named at creation.
+    original_image = MakeImage(runtime->device, runtime->memory_allocator,
+                               TrimmedHostInfo(runtime->device, info, host_level_offset),
+                               runtime->ViewFormats(info.format),
+                               AstcHostFormat(runtime->device, info), false, false, false,
+                               runtime, &original_pool_key);
+    RecordInitialLayout(*scheduler, *original_image,
+                        aspect_mask != 0 ? aspect_mask : ImageAspectMask(info.format));
+    return original_image;
+}
+
+bool Image::StartScaled() {
+    if (!original_pending || !ScaleUp()) {
+        return false;
+    }
+    initialized = true;
+    return true;
+}
+
 bool Image::ScaleUp(bool ignore) {
     const auto& resolution = runtime->resolution;
     if (!resolution.active) {
@@ -4238,6 +4315,13 @@ bool Image::ScaleUp(bool ignore) {
                                  runtime->ViewFormats(info.format), {}, false, false, false,
                                  runtime, &scaled_pool_key);
         ignore = false;
+        if (original_pending) {
+            // Nothing to scale up: the new image only needs its layout.
+            RecordInitialLayout(*scheduler, *scaled_image,
+                                aspect_mask != 0 ? aspect_mask : ImageAspectMask(info.format));
+            current_image = &Image::scaled_image;
+            return true;
+        }
     }
     current_image = &Image::scaled_image;
     if (ignore) {
@@ -4252,7 +4336,16 @@ bool Image::ScaleUp(bool ignore) {
             return false;
         }
     } else {
-        BlitScale(*scheduler, *original_image, *scaled_image, info, aspect_mask, resolution);
+        BlitScale(*scheduler, *OriginalImage(), *scaled_image, info, aspect_mask, resolution);
+    }
+    // EDEN_NX2_RSMAN_VRAM_FREE_ORIGINAL: from here on the scaled image holds the contents (the
+    // 288 MiB of Ocarina of Time's 12288x12288 sun shadow map included). Whatever needs the
+    // unscaled one again (an upload, a download, going back to 1x) makes it.
+    if (original_releasable && original_image) {
+        runtime->DestroyWhenIdle(std::move(original_image));
+        original_image = vk::Image{};
+        original_pool_key = {};
+        original_pending = true;
     }
     return true;
 }
@@ -4266,6 +4359,7 @@ bool Image::ScaleDown(bool ignore) {
         return false;
     }
     ASSERT(info.type != ImageType::Linear);
+    OriginalImage(); // EDEN_NX2_RSMAN_VRAM_*: made now if pending
     flags &= ~ImageFlagBits::Rescaled;
     current_image = &Image::original_image;
     if (ignore) {
@@ -4281,7 +4375,7 @@ bool Image::ScaleDown(bool ignore) {
             return false;
         }
     } else {
-        BlitScale(*scheduler, *scaled_image, *original_image, info, aspect_mask, resolution, false);
+        BlitScale(*scheduler, *scaled_image, *OriginalImage(), info, aspect_mask, resolution, false);
     }
     return true;
 }
