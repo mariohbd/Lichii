@@ -1209,6 +1209,28 @@ size_t EvictAbovePipelines() {
     return evict_above;
 }
 
+/// EDEN_NX2_PIPELINE_KEEP_BUDGET (default on; from zortos293/Lichii#994): the eviction threshold
+/// also fits the disk cache loaded at boot, the whole cache plus 1024 for new content, at most
+/// 12,288 (~5.5 GB of driver memory), so the cache's own pipelines are not evicted and built
+/// again on the GPU thread (OoT, 7,316 cached with a limit of 4,096: 3,925 evicted, 1,395
+/// rebuilt). Never below EvictAbovePipelines; an explicit EDEN_NX2_PIPELINE_EVICT_ABOVE wins.
+/// =0 keeps v5.1's fixed threshold.
+size_t EvictAbovePipelinesForCache(size_t cached_at_boot) {
+    static const bool enabled = [] {
+        const char* v = std::getenv("EDEN_NX2_PIPELINE_KEEP_BUDGET");
+        return v == nullptr || v[0] != '0';
+    }();
+    static const bool forced = std::getenv("EDEN_NX2_PIPELINE_EVICT_ABOVE") != nullptr;
+    const size_t evict_above = EvictAbovePipelines();
+    if (!enabled || forced) {
+        return evict_above;
+    }
+    constexpr size_t NewContentPipelines = 1024;
+    constexpr size_t MaxKeptPipelines = 12288;
+    const size_t for_cache = std::min(cached_at_boot + NewContentPipelines, MaxKeptPipelines);
+    return std::max(evict_above, for_cache);
+}
+
 /// How many of the cached graphics pipelines boot skipped the background builds, newest first;
 /// the rest are built when a draw first needs them. A cache merged from a community pack held
 /// 60k pipelines: building all of them took 15 minutes on 6 threads and, at ~0.45 MB each, held
@@ -2313,6 +2335,25 @@ ComputePipeline* PipelineCache::CurrentComputePipeline() {
     };
     const auto [pair, is_new]{compute_cache.try_emplace(key)};
     auto& entry{pair->second};
+    // EDEN_NX2_COMPUTE_REBUILD_WORKER (default on; Lichii #995 e61ecab335, same as #969's
+    // EDEN_NX2_COMPUTE_KEEP_DISPATCH, which also turns it off with =0): a pointer-slot rebuild
+    // compiles on a worker while dispatches keep using the current pipeline. =0 replaces the
+    // entry at once and the next dispatch waits for the compile, as v5.1 did.
+    static const bool rebuild_worker = [] {
+        const auto on = [](const char* name) {
+            const char* v = std::getenv(name);
+            return v == nullptr || v[0] != '0';
+        };
+        return on("EDEN_NX2_COMPUTE_REBUILD_WORKER") && on("EDEN_NX2_COMPUTE_KEEP_DISPATCH");
+    }();
+    const auto replace = [&](ComputePipelineCacheEntry&& rebuilt) {
+        if (entry.pipeline) {
+            retired_compute_pipelines.emplace_back(scheduler.CurrentTick(),
+                                                   std::move(entry.pipeline));
+        }
+        rebuilt.rebuilds = entry.rebuilds + 1;
+        entry = std::move(rebuilt);
+    };
     if (is_new) {
         entry = CreateComputePipeline(key, shader);
     } else if (entry.pipeline && entry.pipeline->IsPrecompiled() && entry.pipeline->BuildFailed()) {
@@ -2322,21 +2363,41 @@ ComputePipeline* PipelineCache::CurrentComputePipeline() {
         ++precompiled_stats.failed;
         const u32 rebuilds = entry.rebuilds;
         retired_compute_pipelines.emplace_back(scheduler.CurrentTick(), std::move(entry.pipeline));
+        if (entry.pending_rebuild && entry.pending_rebuild->pipeline) {
+            // Its build may still be queued on a worker: retired, not destroyed here.
+            retired_compute_pipelines.emplace_back(scheduler.CurrentTick(),
+                                                   std::move(entry.pending_rebuild->pipeline));
+        }
         entry = CreateComputePipeline(key, shader, entry.mapped_pointers);
         entry.rebuilds = rebuilds;
+    } else if (entry.pending_rebuild) {
+        if (entry.pending_rebuild->pipeline->IsBuilt()) {
+            auto rebuilt{std::move(*entry.pending_rebuild)};
+            entry.pending_rebuild.reset();
+            if (rebuilt.pipeline->IsBound()) {
+                replace(std::move(rebuilt));
+            } else {
+                LOG_WARNING(Render_Vulkan,
+                            "Keeping compute shader {:016x}: rebuild failed to compile",
+                            key.unique_hash);
+                retired_compute_pipelines.emplace_back(scheduler.CurrentTick(),
+                                                       std::move(rebuilt.pipeline));
+                entry.rebuilds = MaxComputeRebuilds;
+            }
+        }
     } else if (!entry.null_pointer_slots.empty() && entry.rebuilds < MaxComputeRebuilds &&
                StaleNullPointerSlot(entry)) {
         // The translation dropped accesses through a pointer that was null back then. Which slots
         // the game fills depends on the area, so the new one keeps binding every pointer this one
         // binds, null now or not: a null pointer binds nothing.
         auto rebuilt{CreateComputePipeline(key, shader, entry.mapped_pointers)};
-        if (rebuilt.pipeline) {
-            if (entry.pipeline) {
-                retired_compute_pipelines.emplace_back(scheduler.CurrentTick(),
-                                                       std::move(entry.pipeline));
-            }
-            rebuilt.rebuilds = entry.rebuilds + 1;
-            entry = std::move(rebuilt);
+        // The current translation keeps running until the new one's driver compile is done.
+        if (rebuild_worker && rebuilt.pipeline && entry.pipeline &&
+            !rebuilt.pipeline->IsBuilt()) {
+            entry.pending_rebuild =
+                std::make_unique<ComputePipelineCacheEntry>(std::move(rebuilt));
+        } else if (rebuilt.pipeline) {
+            replace(std::move(rebuilt));
         } else {
             // Keep the working translation when the new one cannot be built (for example a
             // narrow access that now stays global across two buffers), and stop retrying.
@@ -2778,6 +2839,7 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
     }
 
     LOG_INFO(Render_Vulkan, "Total Pipeline Count: {}", state.total);
+    cached_at_boot_pipelines.store(state.total, std::memory_order::relaxed);
     if (foreign_records != 0) {
         LOG_INFO(Render_Vulkan,
                  "{} cached graphics pipeline records were stored by another GPU driver{}",
@@ -4143,7 +4205,12 @@ std::string PipelineCache::KeptStamp(const std::string& prepared_stamp) const {
     // kept pipelines the same is checked at boot on a sample of them (CheckKeptSample).
     // NX2KEPT4: the SPIR-V emitter changed under kept modules (zortos293/Lichii#902 clip
     // distances; #820 noperspective varyings, then its revert), which the sample only sees if it hits one.
-    return fmt::format("{}kept NX2KEPT4 cache {} settings {:#x} gpl {} oot {} {:016x} canonical "
+    // NX2KEPT5: per-tap gathers with dynamic offsets (#433, EDEN_NX2_GATHER_PER_TAP), the native
+    // global memory helpers' OpSwitch (EDEN_NX2_SPIRV_GMEM_SWITCH), and Shader::Info's
+    // frag_color_components (#353, EDEN_NX2_COLOR_MASK_TRIM), which kept infos serialize. With
+    // those switches off the emitter is v5.1's again, but kept files are prepared again under
+    // this stamp either way.
+    return fmt::format("{}kept NX2KEPT5 cache {} settings {:#x} gpl {} oot {} {:016x} canonical "
                        "{}\n",
                        prepared_stamp, CACHE_VERSION, SpirvSettingsStamp(),
                        device.IsExtGraphicsPipelineLibrarySupported() ? 1 : 0,
@@ -5001,6 +5068,13 @@ GraphicsPipeline* PipelineCache::CurrentGraphicsPipelineSlowPath() {
                 ++translate_stats.skipped;
                 return nullptr;
             }
+            // EDEN_NX2_SHADER_BUILD_BUDGET: past this frame's GPU-thread build budget, a draw
+            // that may be skipped is, and its pipeline is translated in a later frame.
+            if (DeferRuntimeBuild()) {
+                graphics_cache.erase(pair);
+                NoteSkippedLookup();
+                return nullptr;
+            }
             pipeline = CreateGraphicsPipeline();
         }
     } else if (!pipeline && translate_queue) {
@@ -5154,6 +5228,9 @@ void ReportTranslateProfile() {
 void PipelineCache::TickFrame() {
     ++frame_count;
     ReportWorstFrame();
+    // EDEN_NX2_SHADER_BUILD_BUDGET: ReportWorstFrame started the frame's tally anew.
+    build_budget_start = std::chrono::steady_clock::now();
+    build_budget_base = {};
     ReportAsyncDiscard();
     ReportTranslateProfile();
     if (PrecompiledFastMode() != 0) {
@@ -5190,6 +5267,13 @@ void PipelineCache::TickFrame() {
     constexpr u64 EvictCheckFrames = 600;
     if (frame_count % EvictCheckFrames == 0) {
         EvictUnusedPipelines();
+        if (deferred_builds != 0) {
+            LOG_INFO(Render_Vulkan,
+                     "Shader build budget: {} draws skipped and their pipelines built in a later "
+                     "frame in the last {} frames",
+                     deferred_builds, EvictCheckFrames);
+            deferred_builds = 0;
+        }
         if (VideoCore::Nx2Debug::Experiment(23) == 1 &&
             device.IsExtGraphicsPipelineLibrarySupported()) {
             // EXP23 (off by default, unmeasured): a library goes unused once every pipeline
@@ -5231,7 +5315,8 @@ void PipelineCache::EvictUnusedPipelines() {
     // pipelines are ~3.6 GB of driver memory at most. EDEN_NX2_PIPELINE_EVICT_ABOVE sets it.
     // Past it only the excess goes, least recently used first (from zortos293/Lichii#408), so
     // crossing it doesn't drop every stale pipeline at once.
-    const size_t evict_above = EvictAbovePipelines();
+    const size_t evict_above = EvictAbovePipelinesForCache(
+        cached_at_boot_pipelines.load(std::memory_order::relaxed));
     if (graphics_cache.size() <= evict_above) {
         return;
     }
@@ -5347,6 +5432,46 @@ int AsyncDiscardMode() {
         return parsed;
     }();
     return mode;
+}
+
+bool PipelineCache::DeferRuntimeBuild() {
+    // EDEN_NX2_SHADER_BUILD_BUDGET=<ms> (default 24; 0 = off; from A-Man-With-A-Plan-dev/Eglantine
+    // c9b8bb5e52 / e330d49488 via zortos293/Lichii 4553f1a100): GPU-thread time per frame for
+    // run-time pipeline builds (graphics translations and compute builds, as ReportRuntimePipeline
+    // counts them). Once a frame has spent it, a draw that may be skipped (DrawMayBeSkipped, the
+    // rule unbuilt pipelines and EDEN_NX2_ASYNC_TRANSLATE use) is skipped instead of translated
+    // on the GPU thread, so a burst of new content costs a few frames of missing draws instead
+    // of one long stall. With the asynchronous translation such draws already go to the
+    // translation threads; this covers the rest (its queue full, a key it gave up on, or
+    // EDEN_NX2_ASYNC_TRANSLATE=0). It needs asynchronous shaders.
+    static const std::chrono::steady_clock::duration budget = [] {
+        const char* const value = std::getenv("EDEN_NX2_SHADER_BUILD_BUDGET");
+        const int ms = value != nullptr ? std::max(0, std::atoi(value)) : 24;
+        if (ms != 0) {
+            LOG_INFO(Render_Vulkan,
+                     "Shader build budget: {} ms of run-time pipeline builds per frame", ms);
+        }
+        return std::chrono::steady_clock::duration{std::chrono::milliseconds{ms}};
+    }();
+    if (budget == std::chrono::steady_clock::duration::zero() || !use_asynchronous_shaders) {
+        return false;
+    }
+    if (frame_tally.builds - build_budget_base < budget) {
+        return false;
+    }
+    // No present for a while (a loading screen, off-screen work): a new window, so the skipped
+    // draws can't wait for a frame that doesn't come.
+    if (const auto now = std::chrono::steady_clock::now();
+        now - build_budget_start > std::chrono::milliseconds{100}) {
+        build_budget_start = now;
+        build_budget_base = frame_tally.builds;
+        return false;
+    }
+    if (!DrawMayBeSkipped()) {
+        return false;
+    }
+    ++deferred_builds;
+    return true;
 }
 
 bool PipelineCache::DrawMayBeSkipped() const {
