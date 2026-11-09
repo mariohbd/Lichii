@@ -259,8 +259,15 @@ void CoreTiming::ResetTicks() {
 
 u64 CoreTiming::GetClockTicks() const {
     u64 fres = is_multicore ? Common::g_wall_clock.GetCNTPCT() : Common::g_wall_clock.CPUTickToGuestCNTPCT(cpu_ticks);
+    // Switch 2 SDKs convert ticks with a fixed 31.25 MHz, so a scaled counter speeds up every
+    // tick-based time (Ocarina with the Dynamic FPS add-on ran ~1.7x fast on Boost).
+    // EDEN_NX2_NO_BOOST_SCALE=0 scales Switch 2 titles too (v5.1 behaviour).
+    static const bool no_boost_scale = [] {
+        const char* v = std::getenv("EDEN_NX2_NO_BOOST_SCALE");
+        return v == nullptr || v[0] != '0';
+    }();
     if (const u32 target = CpuClockTargetMhz(Settings::values.cpu_clock.GetValue());
-        target != CPU_CLOCK_BASE_MHZ) {
+        target != CPU_CLOCK_BASE_MHZ && !(no_boost_scale && Settings::CurrentProgramIsSwitch2())) {
         fres = fres * target / CPU_CLOCK_BASE_MHZ;
     }
     if (::Settings::values.sync_core_speed.GetValue()) {
