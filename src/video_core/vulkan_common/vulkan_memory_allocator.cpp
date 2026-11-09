@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <array>
 #include <bit>
+#include <cstdlib>
 #include <limits>
 #include <optional>
 #include <type_traits>
@@ -271,6 +272,17 @@ bool MemoryAllocator::AllocateMediumImage(const VkImageCreateInfo &ci, VkImage &
     return true;
 }
 
+namespace {
+/// EDEN_NX2_MEDIUM_IMAGE_POOL=0: images of 8-64 MiB get memory of their own again (Lichii #922).
+bool MediumImagePoolEnabled() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("EDEN_NX2_MEDIUM_IMAGE_POOL");
+        return value == nullptr || value[0] != '0';
+    }();
+    return enabled;
+}
+} // namespace
+
 VkResult MemoryAllocator::AllocateImage(const VkImageCreateInfo &ci, bool dedicated, bool may_fail,
                                         vk::Image &image) const {
     const VmaAllocationCreateInfo alloc_ci = {
@@ -295,7 +307,7 @@ VkResult MemoryAllocator::AllocateImage(const VkImageCreateInfo &ci, bool dedica
     const u64 texels = u64{ci.extent.width} * ci.extent.height * ci.extent.depth * ci.arrayLayers;
     const bool huge = texels > MaxBackedImageTexels;
     VkResult result = VK_ERROR_OUT_OF_DEVICE_MEMORY;
-    if (!dedicated && !huge && texels >= (u64{1} << 20) &&
+    if (!dedicated && !huge && texels >= (u64{1} << 20) && MediumImagePoolEnabled() &&
         AllocateMediumImage(ci, handle, allocation)) {
         vmaGetAllocationInfo(allocator, allocation, &alloc_info);
         result = VK_SUCCESS;

@@ -1479,7 +1479,13 @@ void BufferCache<P>::BindHostGraphicsUniformBuffer(size_t stage, u32 index, u32 
     // Ocarina of Time is left out (unless EDEN_NX2_PERF_VERIFY=1): a compare of its banks against
     // shadow copies found no page changed behind the tracker, and the uploads cost frame rate.
     constexpr u64 ocarina_of_time = 0x0400486024DEC000ULL;
-    const bool bank_recheck = program_id != ocarina_of_time || Nx2Perf::Verify();
+    // EDEN_NX2_OOT_BANK_SKIP=0 uploads Ocarina's banks once a frame again.
+    static const bool oot_bank_skip = [] {
+        const char* value = std::getenv("EDEN_NX2_OOT_BANK_SKIP");
+        return value == nullptr || value[0] != '0';
+    }();
+    const bool bank_recheck =
+        !oot_bank_skip || program_id != ocarina_of_time || Nx2Perf::Verify();
     if (bank_recheck && has_host_buffer &&
         (*channel_state->uniform_buffer_sizes)[stage][index] == 0x10000 &&
         size != 0 && gpu_memory != nullptr && gpu_memory->UsesNativeTiling() &&
