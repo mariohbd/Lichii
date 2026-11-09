@@ -43,6 +43,7 @@
 #include "video_core/renderer_vulkan/vk_staging_buffer_pool.h"
 #include "video_core/surface.h"
 #include "video_core/texture_cache/formatter.h"
+#include "video_core/texture_cache/rsman_vram.h"
 #include "video_core/texture_cache/samples_helper.h"
 #include "video_core/texture_cache/util.h"
 #include "video_core/dlss_contract.h"
@@ -2984,6 +2985,10 @@ void TextureCacheRuntime::PoolImage(const ImagePoolKey& key, vk::Image image, u6
     TrimImagePool(ImagePoolMaxBytes);
 }
 
+void TextureCacheRuntime::DestroyWhenIdle(vk::Image&& image) {
+    images_to_destroy.emplace_back(scheduler.CurrentTick(), std::move(image));
+}
+
 void TextureCacheRuntime::TrimImagePool(u64 max_bytes) {
     while (!image_pool.empty() && image_pool_bytes > max_bytes) {
         image_pool_bytes -= image_pool.front().bytes;
@@ -2993,6 +2998,9 @@ void TextureCacheRuntime::TrimImagePool(u64 max_bytes) {
 }
 
 void TextureCacheRuntime::TickFrame() {
+    while (!images_to_destroy.empty() && scheduler.IsFree(images_to_destroy.front().first)) {
+        images_to_destroy.pop_front();
+    }
     ++image_pool_frame;
     {
         // EXP42's pool: images older than ImagePoolMaxFrames go, and all of them when the
@@ -3094,6 +3102,17 @@ Image::Image(TextureCacheRuntime& runtime_, const ImageInfo& info_, GPUVAddr gpu
     if (OutOfMemory()) {
         return;
     }
+    // EDEN_NX2_RSMAN_VRAM_FREE_ORIGINAL (zortos293/Lichii#267): plain 2D images only, whose
+    // unscaled image OriginalImage() makes again the same way, and that scale without the helper
+    // (its cached views would keep the freed image).
+    static const bool free_original = VideoCommon::RsManVram::Enabled("EDEN_NX2_RSMAN_VRAM_FREE_ORIGINAL");
+    original_releasable =
+        free_original && (original_pending || (original_image && !original_image.IsUnbacked())) &&
+        info.type == ImageType::e2D && info.num_samples == 1 && info.resources.levels == 1 &&
+        !info.is_sparse && host_level_offset == 0 && !IsPixelFormatASTC(info.format) &&
+        !IsPixelFormatBCn(info.format) && !UsesSparseLayers(runtime_.device, info, gpu_addr_) &&
+        !UsesSparseTiles(runtime_.device, info, gpu_addr_) &&
+        !IsUnwrittenSparse(runtime_.device, info, gpu_addr_) && !NeedsScaleHelper();
     if (original_image.IsUnbacked()) {
         flags |= VideoCommon::ImageFlagBits::Unbacked;
         const ImageInfo host_info = TrimmedHostInfo(runtime_.device, info, host_level_offset);
@@ -4315,6 +4334,15 @@ bool Image::ScaleUp(bool ignore) {
         }
     } else {
         BlitScale(*scheduler, *OriginalImage(), *scaled_image, info, aspect_mask, resolution);
+    }
+    // EDEN_NX2_RSMAN_VRAM_FREE_ORIGINAL: from here on the scaled image holds the contents (the
+    // 288 MiB of Ocarina of Time's 12288x12288 sun shadow map included). Whatever needs the
+    // unscaled one again (an upload, a download, going back to 1x) makes it.
+    if (original_releasable && original_image) {
+        runtime->DestroyWhenIdle(std::move(original_image));
+        original_image = vk::Image{};
+        original_pool_key = {};
+        original_pending = true;
     }
     return true;
 }
