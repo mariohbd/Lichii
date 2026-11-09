@@ -15,9 +15,8 @@
 #include "common/hex_util.h"
 #include "common/logging.h"
 #include "common/settings.h"
-#ifndef _WIN32
 #include "common/string_util.h"
-#endif
+#include "common/zstd_compression.h"
 
 #include "core/core.h"
 #include "core/file_sys/common_funcs.h"
@@ -36,6 +35,7 @@
 #include "core/loader/loader.h"
 #include "core/loader/nso.h"
 #include "core/memory/cheat_engine.h"
+#include "core/oot_ultrawide_hud.h"
 
 namespace FileSys {
 namespace {
@@ -730,6 +730,84 @@ std::vector<Core::Memory::CheatEntry> PatchManager::CreateCheatList(const BuildI
     return out;
 }
 
+namespace {
+
+// Puts `data` at `path` (relative, '/'-separated) under `root`, creating the directories.
+void PlaceFile(VectorVfsDirectory& root, std::string_view path, std::vector<u8> data) {
+    VectorVfsDirectory* dir = &root;
+    size_t slash;
+    while ((slash = path.find('/')) != std::string_view::npos) {
+        const auto name = path.substr(0, slash);
+        auto sub = dir->GetSubdirectory(name);
+        if (sub == nullptr) {
+            auto created = std::make_shared<VectorVfsDirectory>(
+                std::vector<VirtualFile>{}, std::vector<VirtualDir>{}, std::string{name});
+            dir->AddDirectory(created);
+            sub = std::move(created);
+        }
+        dir = static_cast<VectorVfsDirectory*>(sub.get());
+        path.remove_prefix(slash + 1);
+    }
+    dir->AddFile(std::make_shared<VectorVfsFile>(std::move(data), std::string{path}));
+}
+
+/// Ocarina with Ivan0xFF's 3440x1440 ultrawide mod enabled (a load/ mod whose name holds
+/// "Ultrawide" and "3440x1440" and that patches the ExeFS): its HUD's edge anchors moved to the
+/// 21:9 screen's edges, as a RomFS layer (Lichii #831). EDEN_OOT_UW_HUD_EDGES=0 keeps the HUD in
+/// the centred 16:9.
+bool UltrawideModEnabled(const std::vector<VirtualDir>& patch_dirs,
+                         const std::vector<std::string>& disabled) {
+    // EDEN_NX2_OOT_HUD_EDGES=0 (or the source's name, EDEN_OOT_UW_HUD_EDGES=0) turns it off.
+    static const bool edges_enabled = [] {
+        for (const char* const name : {"EDEN_NX2_OOT_HUD_EDGES", "EDEN_OOT_UW_HUD_EDGES"}) {
+            const char* const value = std::getenv(name);
+            if (value != nullptr && value[0] == '0') {
+                return false;
+            }
+        }
+        return true;
+    }();
+    if (!edges_enabled) {
+        return false;
+    }
+    for (const auto& subdir : patch_dirs) {
+        const std::string name = Common::ToLower(subdir->GetName());
+        if (name.find("ultrawide") != std::string::npos &&
+            name.find("3440x1440") != std::string::npos &&
+            std::find(disabled.cbegin(), disabled.cend(), subdir->GetName()) == disabled.cend() &&
+            FindSubdirectoryCaseless(subdir, "exefs") != nullptr) {
+            return true;
+        }
+    }
+    return false;
+}
+
+VirtualDir UltrawideHudLayer(const VirtualDir& romfs) {
+    namespace Uw = Core::OotUltrawideHud;
+    const auto archive = romfs->GetFileRelative(Uw::LayoutArchivePath);
+    const auto pack = romfs->GetFileRelative(Uw::DictionaryPackPath);
+    const auto pack_data =
+        pack ? ::Common::Compression::TryDecompressDataZSTD(pack->ReadAllBytes(), 64ULL << 20)
+             : std::nullopt;
+    const auto dictionary =
+        pack_data ? Uw::SarcFile(*pack_data, Uw::LayoutDictionaryName) : std::nullopt;
+    auto anchored = archive && dictionary
+                        ? Uw::AnchorHudToEdges(archive->ReadAllBytes(), *dictionary)
+                        : std::nullopt;
+    if (!anchored) {
+        LOG_WARNING(Loader, "    RomFS: {} is not the layout archive the ultrawide HUD expects",
+                    Uw::LayoutArchivePath);
+        return nullptr;
+    }
+    LOG_INFO(Loader, "    RomFS: ultrawide HUD moves the HUD's edge anchors out by {} units",
+             Uw::EdgeShift);
+    auto layer = std::make_shared<VectorVfsDirectory>();
+    PlaceFile(*layer, Uw::LayoutArchivePath, std::move(*anchored));
+    return layer;
+}
+
+} // Anonymous namespace
+
 void PatchManager::ApplyLayeredFS(VirtualFile& romfs, ContentRecordType type) const {
     const auto load_dir = GetModificationLoadRoot();
     const auto sdmc_load_dir = GetModificationLoadRoot(true);
@@ -780,8 +858,12 @@ void PatchManager::ApplyLayeredFS(VirtualFile& romfs, ContentRecordType type) co
         }
     }
 
+    const bool ultrawide_hud = type == ContentRecordType::Program &&
+                               title_id == Core::OotUltrawideHud::ProgramId &&
+                               UltrawideModEnabled(patch_dirs, disabled);
+
     // When there are no layers to apply, return early as there is no need to rebuild the RomFS
-    if (layers.empty() && layers_ext.empty()) {
+    if (layers.empty() && layers_ext.empty() && !ultrawide_hud) {
         return;
     }
 
@@ -790,6 +872,13 @@ void PatchManager::ApplyLayeredFS(VirtualFile& romfs, ContentRecordType type) co
         return;
     }
 
+    if (ultrawide_hud) {
+        if (auto hud_layer = UltrawideHudLayer(extracted)) {
+            layers.emplace_back(std::move(hud_layer));
+        } else if (layers.empty() && layers_ext.empty()) {
+            return;
+        }
+    }
     layers.emplace_back(std::move(extracted));
 
     auto layered = LayeredVfsDirectory::MakeLayeredDirectory(std::move(layers));
