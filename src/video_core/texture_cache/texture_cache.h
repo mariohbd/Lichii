@@ -3935,6 +3935,7 @@ ImageId TextureCache<P>::JoinImages(const ImageInfo& info, GPUVAddr gpu_addr, DA
             const AliasedImage& aliased = new_image.aliased_images[alias_pointer->second];
             CopyImage(new_image_id, aliased.id, aliased.copies);
             new_image.modification_tick = overlap.modification_tick;
+            RaiseAliasTicks(new_image);
             continue;
         }
         if (True(overlap.flags & ImageFlagBits::GpuModified)) {
@@ -3950,6 +3951,7 @@ ImageId TextureCache<P>::JoinImages(const ImageInfo& info, GPUVAddr gpu_addr, DA
                 runtime.CopyImage(new_image, overlap, copies);
             }
             new_image.modification_tick = overlap.modification_tick;
+            RaiseAliasTicks(new_image);
         }
         if (True(overlap.flags & ImageFlagBits::Tracked)) {
             UntrackImage(overlap, copy_object.id);
@@ -4871,6 +4873,7 @@ template <class P>
 void TextureCache<P>::MarkModification(ImageBase& image) noexcept {
     image.flags |= ImageFlagBits::GpuModified;
     image.modification_tick = ++modification_tick;
+    RaiseAliasTicks(image);
     image.last_write_frame = RenderFrame();
     if (!clearing_render_targets) {
         image.drawn_since_clear = true;
@@ -5155,9 +5158,26 @@ void TextureCache<P>::TickRelocationTombstones() {
 }
 
 template <class P>
+void TextureCache<P>::RaiseAliasTicks(ImageBase& image) noexcept {
+    for (const AliasedImage& alias : image.aliased_images) {
+        ImageBase& other = slot_images[alias.id];
+        other.newest_alias_tick = (std::max)(other.newest_alias_tick, image.modification_tick);
+    }
+}
+
+template <class P>
 void TextureCache<P>::SynchronizeAliases(ImageId image_id) {
     boost::container::small_vector<const AliasedImage*, 8> aliased_images;
     Image& image = slot_images[image_id];
+    // EDEN_NX2_ALIAS_SYNC_SKIP (read once): nothing aliased was modified after this image, so
+    // skip walking its (possibly long) alias list for every draw that samples it.
+    static const bool alias_sync_skip = [] {
+        const char* v = std::getenv("EDEN_NX2_ALIAS_SYNC_SKIP");
+        return v == nullptr || v[0] != '0';
+    }();
+    if (alias_sync_skip && image.newest_alias_tick <= image.modification_tick) {
+        return;
+    }
     bool any_rescaled = True(image.flags & ImageFlagBits::Rescaled);
     bool any_modified = True(image.flags & ImageFlagBits::GpuModified);
     u64 most_recent_tick = image.modification_tick;
@@ -5182,6 +5202,7 @@ void TextureCache<P>::SynchronizeAliases(ImageId image_id) {
         }
     }
     image.modification_tick = most_recent_tick;
+    RaiseAliasTicks(image);
     if (any_modified) {
         image.flags |= ImageFlagBits::GpuModified;
     }

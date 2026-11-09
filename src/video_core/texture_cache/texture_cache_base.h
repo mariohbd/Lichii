@@ -760,6 +760,9 @@ private:
     /// Mark an image as modified from the GPU
     void MarkModification(ImageBase& image) noexcept;
 
+    /// Raises the newest_alias_tick of image's aliases to its modification_tick.
+    void RaiseAliasTicks(ImageBase& image) noexcept;
+
     /// Synchronize image aliases, copying data if needed
     void SynchronizeAliases(ImageId image_id);
 
