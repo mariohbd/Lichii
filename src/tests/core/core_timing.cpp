@@ -7,10 +7,12 @@
 #include <bitset>
 #include <chrono>
 #include <cstdlib>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <string>
 
+#include "common/settings.h"
 #include "core/core.h"
 #include "core/core_timing.h"
 
@@ -143,4 +145,79 @@ TEST_CASE("CoreTiming[BasicOrderNoPausing]", "[core]") {
     printf("HostTimer No Pausing Scheduling Time: %.3f %.6f\n", micro, mili);
     printf("HostTimer No Pausing Timer Time: %.3f %.6f\n", timer_time / 1000.f,
            timer_time / 1000000.f);
+}
+
+TEST_CASE("CoreTiming[ClockTicksCpuClock]", "[core]") {
+    Settings::values.sync_core_speed.SetValue(false);
+    Settings::values.use_custom_cpu_ticks.SetValue(false);
+
+    Core::Timing::CoreTiming core_timing;
+    core_timing.SetMulticore(false);
+    core_timing.AddTicks(1'000'000);
+
+    const auto ticks_with = [&](Settings::CpuClock clock, bool switch2) {
+        Settings::values.cpu_clock.SetValue(clock);
+        Settings::SetCurrentProgramIsSwitch2(switch2);
+        return core_timing.GetClockTicks();
+    };
+
+    const u64 normal = ticks_with(Settings::CpuClock::Normal, false);
+    REQUIRE(ticks_with(Settings::CpuClock::Boost, false) == normal * 1734 / 1020);
+    REQUIRE(ticks_with(Settings::CpuClock::Overclock, false) == normal * 2040 / 1020);
+
+    const u64 normal_switch2 = ticks_with(Settings::CpuClock::Normal, true);
+    REQUIRE(ticks_with(Settings::CpuClock::Boost, true) == normal_switch2);
+    REQUIRE(ticks_with(Settings::CpuClock::Overclock, true) == normal_switch2);
+
+    Settings::values.cpu_clock.SetValue(Settings::CpuClock::Normal);
+    Settings::SetCurrentProgramIsSwitch2(false);
+}
+
+TEST_CASE("CoreTiming[DroppedEventType]", "[core]") {
+    // An event whose type is destroyed while it is queued is dropped when it falls due; it used
+    // to stay at the top of the queue and keep Advance looping forever.
+    Core::Timing::CoreTiming core_timing;
+    core_timing.SetMulticore(false);
+    bool later_ran = false;
+    auto gone = Core::Timing::CreateEvent(
+        "gone", [](s64, std::chrono::nanoseconds) { return std::nullopt; });
+    const auto later = Core::Timing::CreateEvent("later", [&](s64, std::chrono::nanoseconds) {
+        later_ran = true;
+        return std::nullopt;
+    });
+    core_timing.ScheduleEvent(std::chrono::nanoseconds{0}, gone);
+    core_timing.ScheduleEvent(std::chrono::nanoseconds{1}, later);
+    gone.reset();
+    core_timing.AddTicks(1'000'000);
+    REQUIRE_FALSE(core_timing.Advance().has_value());
+    REQUIRE(later_ran);
+}
+
+TEST_CASE("CoreTiming[WakeOnlyWhenNeeded]", "[core]") {
+    // ScheduleEvent wakes the timer thread only for an event due before it looks at the queue
+    // again (planned_wake). EDEN_NX2_TIMING_SLEEP=0 wakes it every time.
+    const char* const sleep_switch = std::getenv("EDEN_NX2_TIMING_SLEEP");
+    if (sleep_switch != nullptr && sleep_switch[0] == '0') {
+        return;
+    }
+    Core::Timing::CoreTiming core_timing;
+    core_timing.SetMulticore(false);
+    core_timing.planned_wake = 1'000;
+    CHECK(core_timing.NeedsWake(999));
+    CHECK_FALSE(core_timing.NeedsWake(1'000));
+    CHECK_FALSE(core_timing.NeedsWake(5'000));
+
+    // Advance plans the next look: nothing queued means never, so any new event wakes it.
+    REQUIRE_FALSE(core_timing.Advance().has_value());
+    CHECK(core_timing.planned_wake == (std::numeric_limits<s64>::max)());
+    CHECK(core_timing.NeedsWake(1'000'000'000'000));
+    // With an event queued, it looks again when that event is due.
+    const auto later = Core::Timing::CreateEvent(
+        "later", [](s64, std::chrono::nanoseconds) { return std::nullopt; });
+    core_timing.ScheduleEvent(std::chrono::milliseconds{10}, later);
+    const auto next = core_timing.Advance();
+    REQUIRE(next.has_value());
+    CHECK(core_timing.planned_wake == *next);
+    CHECK_FALSE(core_timing.NeedsWake(*next + 1'000'000'000));
+    core_timing.UnscheduleEvent(later);
 }

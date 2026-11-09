@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <cstdlib>
+#include <limits>
 #include <mutex>
 #include <string>
 #include <tuple>
@@ -39,6 +40,17 @@ constexpr u32 CpuClockTargetMhz(Settings::CpuClock clock) {
         return CPU_CLOCK_BASE_MHZ;
     }
 }
+
+namespace {
+// EDEN_NX2_TIMING_SLEEP=0: every ScheduleEvent wakes the timer thread (v5.1 behaviour).
+bool WakeOnlyWhenNeeded() {
+    static const bool enabled = [] {
+        const char* v = std::getenv("EDEN_NX2_TIMING_SLEEP");
+        return v == nullptr || v[0] != '0';
+    }();
+    return enabled;
+}
+} // Anonymous namespace
 
 std::shared_ptr<EventType> CreateEvent(std::string name, TimedCallback&& callback) {
     return std::make_shared<EventType>(std::move(callback), std::move(name));
@@ -79,6 +91,11 @@ void CoreTiming::Wake() {
 
 void CoreTiming::Initialize(std::function<void()>&& on_thread_init_) {
     Reset();
+    {
+        // The new timer thread starts with an Advance: wake it for anything until then.
+        std::scoped_lock scope{basic_lock};
+        planned_wake = (std::numeric_limits<s64>::min)();
+    }
     on_thread_init = std::move(on_thread_init_);
     event_fifo_id = 0;
     cpu_ticks = 0;
@@ -183,21 +200,25 @@ bool CoreTiming::HasPendingEvents() const {
 
 void CoreTiming::ScheduleEvent(std::chrono::nanoseconds ns_into_future,
                                const std::shared_ptr<EventType>& event_type, bool absolute_time) {
+    bool wake;
     {
         std::scoped_lock scope{basic_lock};
         const auto next_time{absolute_time ? ns_into_future : GetGlobalTimeNs() + ns_into_future};
 
         auto h{event_queue.emplace(Event{next_time.count(), event_fifo_id++, event_type, 0})};
         (*h).handle = h;
+        wake = NeedsWake(next_time.count());
     }
-
-    Wake();
+    if (wake) {
+        Wake();
+    }
 }
 
 void CoreTiming::ScheduleLoopingEvent(std::chrono::nanoseconds start_time,
                                       std::chrono::nanoseconds resched_time,
                                       const std::shared_ptr<EventType>& event_type,
                                       bool absolute_time) {
+    bool wake;
     {
         std::scoped_lock scope{basic_lock};
         const auto next_time{absolute_time ? start_time : GetGlobalTimeNs() + start_time};
@@ -205,9 +226,17 @@ void CoreTiming::ScheduleLoopingEvent(std::chrono::nanoseconds start_time,
         auto h{event_queue.emplace(
             Event{next_time.count(), event_fifo_id++, event_type, resched_time.count()})};
         (*h).handle = h;
+        wake = NeedsWake(next_time.count());
     }
+    if (wake) {
+        Wake();
+    }
+}
 
-    Wake();
+bool CoreTiming::NeedsWake(s64 time) const {
+    // The timer thread looks at the queue again by planned_wake (Advance), or right away while it
+    // is in Advance (planned_wake is then the minimum). A later event can wait for that look.
+    return !WakeOnlyWhenNeeded() || time < planned_wake;
 }
 
 void CoreTiming::UnscheduleEvent(const std::shared_ptr<EventType>& event_type,
@@ -259,8 +288,15 @@ void CoreTiming::ResetTicks() {
 
 u64 CoreTiming::GetClockTicks() const {
     u64 fres = is_multicore ? Common::g_wall_clock.GetCNTPCT() : Common::g_wall_clock.CPUTickToGuestCNTPCT(cpu_ticks);
+    // Switch 2 SDKs convert ticks with a fixed 31.25 MHz, so a scaled counter speeds up every
+    // tick-based time (Ocarina with the Dynamic FPS add-on ran ~1.7x fast on Boost).
+    // EDEN_NX2_NO_BOOST_SCALE=0 scales Switch 2 titles too (v5.1 behaviour).
+    static const bool no_boost_scale = [] {
+        const char* v = std::getenv("EDEN_NX2_NO_BOOST_SCALE");
+        return v == nullptr || v[0] != '0';
+    }();
     if (const u32 target = CpuClockTargetMhz(Settings::values.cpu_clock.GetValue());
-        target != CPU_CLOCK_BASE_MHZ) {
+        target != CPU_CLOCK_BASE_MHZ && !(no_boost_scale && Settings::CurrentProgramIsSwitch2())) {
         fres = fres * target / CPU_CLOCK_BASE_MHZ;
     }
     if (::Settings::values.sync_core_speed.GetValue()) {
@@ -279,12 +315,22 @@ u64 CoreTiming::GetGPUTicks() const {
 
 std::optional<s64> CoreTiming::Advance() {
     std::scoped_lock lock{advance_lock, basic_lock};
+    // Scanning: events scheduled from here on are seen below, so they need no wake-up.
+    planned_wake = (std::numeric_limits<s64>::min)();
     global_timer = GetGlobalTimeNs().count();
 
     while (!event_queue.empty() && event_queue.top().time <= global_timer) {
         const Event& evt = event_queue.top();
 
-        if (const auto event_type{evt.type.lock()}) {
+        const auto event_type{evt.type.lock()};
+        if (!event_type) {
+            // Its type is gone (destroyed without UnscheduleEvent): drop it. Left at the top, the
+            // loop would spin here for good, holding the lock every ScheduleEvent needs.
+            event_queue.pop();
+            global_timer = GetGlobalTimeNs().count();
+            continue;
+        }
+        {
             const auto evt_time = evt.time;
             const auto evt_sequence_num = event_type->sequence_number;
 
@@ -330,8 +376,12 @@ std::optional<s64> CoreTiming::Advance() {
     }
 
     if (!event_queue.empty()) {
+        // The timer thread waits until the top event (high resolution or timed wait), so it looks
+        // at the queue again then. Decided under the lock that ScheduleEvent compares under.
+        planned_wake = event_queue.top().time;
         return event_queue.top().time;
     } else {
+        planned_wake = (std::numeric_limits<s64>::max)();
         return std::nullopt;
     }
 }

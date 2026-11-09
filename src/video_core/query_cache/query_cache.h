@@ -345,13 +345,23 @@ void QueryCacheBase<Traits>::CounterReport(GPUVAddr addr, QueryType counter_type
     // (as Balanced already does), and its fence is made and waited for even when empty
     // (g_signaling_query_report_fence). Both halves: the fence alone, with the query freed at
     // once, left a stale operation behind (three channels waiting forever on a semaphore).
-    const bool keep_fence_report = is_fence && VideoCore::Nx2Debug::Experiment(33) != 0;
-    const bool is_synced = !keep_fence_report &&
-                           (Settings::IsGPUFenceBehaviorDefault()
-                                ? !VideoCore::Nx2Debug::AccuratePart(1)
-                                : !Settings::IsGPUFenceBehaviorBalanced() &&
-                                      !Settings::IsGPUFenceBehaviorAccurate()) &&
-                           is_fence;
+    const bool low_accuracy_sync = Settings::IsGPUFenceBehaviorDefault()
+                                       ? !VideoCore::Nx2Debug::AccuratePart(1)
+                                       : !Settings::IsGPUFenceBehaviorBalanced() &&
+                                             !Settings::IsGPUFenceBehaviorAccurate();
+    // EDEN_NX2_QUERY_LOW_ACC_SYNC (zortos293/Lichii#874, on unless 0): a fence-flagged payload
+    // release writes a constant, so where it was synchronized before EXP33 it stays so: its fence
+    // may be skipped and the query freed at once. Only reports of GPU counters keep EXP33's wait
+    // (with EXP33 a channel's acquire otherwise waited for the host GPU, ~1,700 delayed fences a
+    // second in Ocarina of Time). No effect while EXP33 is off.
+    static const bool payload_stays_synced = [] {
+        const char* v = std::getenv("EDEN_NX2_QUERY_LOW_ACC_SYNC");
+        return v == nullptr || v[0] != '0';
+    }();
+    const bool keep_fence_report =
+        is_fence && VideoCore::Nx2Debug::Experiment(33) != 0 &&
+        !(payload_stays_synced && counter_type == QueryType::Payload && low_accuracy_sync);
+    const bool is_synced = !keep_fence_report && low_accuracy_sync && is_fence;
     // Counted for Nx2AsyncReportsSettled (SEM_FAST) and FlushQueryResults' own-report wait
     // (EXP30, zortos293/Lichii#559): completed on every way out of the operation, written or
     // discarded, and when the operation is dropped without running.

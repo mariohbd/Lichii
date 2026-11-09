@@ -146,6 +146,7 @@ public:
             }
             pending_operations.emplace_back(std::move(uncommitted_operations));
             uncommitted_operations.clear(); // moved-from: make it empty explicitly
+            uncommitted_operations.reserve(64);
         }
         pending_flushes.push_back(committed_flushes);
         if constexpr (can_async_check) {
@@ -347,7 +348,7 @@ private:
         }();
         struct Released {
             TFence fence;
-            std::deque<std::function<void()>> operations;
+            OperationList operations;
             u8 flushes;
             u32 query_pops; ///< Query cache entries: one per fence, folded ones included
         };
@@ -469,7 +470,7 @@ private:
         }
         if (!fence_thread_busy && !inline_running && GpuSplit::OnBackThread()) {
             inline_running = true;
-            std::deque<std::function<void()>> operations;
+            OperationList operations;
             {
                 std::scoped_lock ops_lock{uncommitted_guard};
                 operations.swap(uncommitted_operations);
@@ -651,8 +652,12 @@ private:
     }
 
     std::queue<TFence> fences;
-    std::deque<std::function<void()>> uncommitted_operations;
-    std::deque<std::deque<std::function<void()>>> pending_operations;
+    // LOCAL TEST (Zelda): vectors, not deques. MSVC's deque of std::function holds one element per
+    // block, so every queued operation (one per query report, ~1000 objects a frame in Ocarina's
+    // Kokiri Forest) allocated a block.
+    using OperationList = std::vector<std::function<void()>>;
+    OperationList uncommitted_operations;
+    std::deque<OperationList> pending_operations;
     std::deque<u8> pending_flushes; ///< Per fence: the caches that committed downloads
     std::deque<u32> pending_query_pops; ///< Async check, per fence: query cache entries to pop
     bool fence_thread_busy{}; ///< Guarded by guard: the fencing thread releases fences it took
