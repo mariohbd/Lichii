@@ -117,8 +117,25 @@ void CoreTiming::Initialize(std::function<void()>&& on_thread_init_) {
                             // A high resolution timer keeps the guest's events (vsync among them)
                             // on time even where Windows doesn't honour our timer resolution
                             // request (Windows 11: players gained ~30% fps from making it global).
-                            if (!Common::Windows::WaitHighResolution(
-                                    hires_timer, wake_handle, std::chrono::nanoseconds(wait_time)))
+                            // EDEN_NX2_WAITABLE_TIMER (default on): the timer sleeps all but the
+                            // last 300 us, which the precise Event::WaitFor finishes, so events
+                            // are not late by the timer's ~0.5 ms granularity. =0: timer only.
+                            static const s64 precise_tail_ns = [] {
+                                const char* v = std::getenv("EDEN_NX2_WAITABLE_TIMER");
+                                return (v == nullptr || v[0] != '0') ? s64{300'000} : s64{0};
+                            }();
+                            bool slept = false;
+                            if (wait_time > precise_tail_ns) {
+                                slept = Common::Windows::WaitHighResolution(
+                                    hires_timer, wake_handle,
+                                    std::chrono::nanoseconds(wait_time - precise_tail_ns));
+                                // Woken early (Wake) the loop re-runs Advance, as without the tail.
+                                const auto left = *next_time - GetGlobalTimeNs().count();
+                                if (slept && left > 0 && left <= precise_tail_ns) {
+                                    event.WaitFor(std::chrono::nanoseconds(left));
+                                }
+                            }
+                            if (!slept)
 #endif
                                 event.WaitFor(std::chrono::nanoseconds(wait_time));
                         }
