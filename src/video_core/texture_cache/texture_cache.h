@@ -4209,8 +4209,26 @@ ImageViewId TextureCache<P>::FindDepthBuffer() {
     if (gpu_addr == 0) {
         return ImageViewId{};
     }
-    const ImageInfo info(regs.zeta, regs.zeta_size, regs.anti_alias_samples_mode);
-    return FindRenderTargetView(info, gpu_addr);
+    ImageInfo info(regs.zeta, regs.zeta_size, regs.anti_alias_samples_mode);
+    // A square depth target with no color target is a shadow map: its size doesn't set the output
+    // resolution, and scaling it only multiplies its memory by the square of the scale (648 MiB for
+    // Ocarina of Time's 12288x12288 sun shadow map at 1.5x). A full-screen depth prepass isn't square.
+    // EDEN_NX2_SHADOW_NATIVE=0 (read once) scales them as v5.1 did.
+    static const bool shadow_native = [] {
+        const char* v = std::getenv("EDEN_NX2_SHADOW_NATIVE");
+        return v == nullptr || v[0] != '0';
+    }();
+    const bool shadow_map =
+        shadow_native && regs.rt_control.count == 0 && info.size.width == info.size.height;
+    if (shadow_map) {
+        info.rescaleable = false;
+    }
+    const ImageViewId view_id = FindRenderTargetView(info, gpu_addr);
+    if (shadow_map && view_id && view_id != NULL_IMAGE_VIEW_ID) {
+        // The image may exist already, made when a texture read it first.
+        slot_images[slot_image_views[view_id].image_id].info.rescaleable = false;
+    }
+    return view_id;
 }
 
 template <class P>
