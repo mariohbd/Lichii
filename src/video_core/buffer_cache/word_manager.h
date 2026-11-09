@@ -9,6 +9,7 @@
 #include <algorithm>
 #include <atomic>
 #include <bit>
+#include <cstdlib>
 #include <limits>
 #include <span>
 #include <utility>
@@ -27,6 +28,16 @@ namespace VideoCommon {
 constexpr u64 PAGES_PER_WORD = 64;
 constexpr u64 BYTES_PER_PAGE = Core::DEVICE_PAGESIZE;
 constexpr u64 BYTES_PER_WORD = PAGES_PER_WORD * BYTES_PER_PAGE;
+
+/// EDEN_NX2_BC_SKIP_CLEAN_WORDS (default on, 0 = off): ForEachModifiedRange skips words with no
+/// modified page and nothing to clear.
+inline bool SkipCleanWords() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("EDEN_NX2_BC_SKIP_CLEAN_WORDS");
+        return value == nullptr || value[0] != '0';
+    }();
+    return enabled;
+}
 
 enum class Type {
     CPU,
@@ -177,10 +188,16 @@ struct WordManager {
                  (pending_pointer - pending_offset) * BYTES_PER_PAGE);
         };
         CollectedRanges ranges;
+        const bool skip_clean_words = SkipCleanWords();
         IterateWords(offset, size, [&](size_t index, u64 mask) {
             if (type == Type::GPU)
                 mask &= ~untracked_words[index];
             const u64 word = state_words[index] & mask;
+            if (skip_clean_words && word == 0 &&
+                (!clear || ((type != Type::CPU && type != Type::CachedCPU) ||
+                            (untracked_words[index] & mask) == 0))) {
+                return;
+            }
             if (clear) {
                 if (type == Type::CPU || type == Type::CachedCPU) {
                     CollectChangedRanges(true, index, untracked_words[index], mask, ranges);
