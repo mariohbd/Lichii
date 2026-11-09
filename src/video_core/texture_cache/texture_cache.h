@@ -4258,7 +4258,18 @@ ImageViewId TextureCache<P>::FindDepthBuffer() {
     if (gpu_addr == 0) {
         return ImageViewId{};
     }
-    const ImageInfo info(regs.zeta, regs.zeta_size, regs.anti_alias_samples_mode);
+    ImageInfo info(regs.zeta, regs.zeta_size, regs.anti_alias_samples_mode);
+    // EDEN_NX2_RSMAN_VRAM_SQUARE_DEPTH (zortos293/Lichii#267, #288): Ocarina of Time renders its
+    // shadow maps with the width aligned up to 16 (800x793), then samples them as the square
+    // texture they are (793x793) at the same address. Two images meant a copy between them for
+    // each new size, and these change every frame while the camera moves. A target of that
+    // shape really drawn wider than its height would be clipped.
+    static const bool square_depth = RsManVram::Enabled("EDEN_NX2_RSMAN_VRAM_SQUARE_DEPTH");
+    if (square_depth && info.format == VideoCore::Surface::PixelFormat::D32_FLOAT &&
+        info.type == ImageType::e2D && info.size.width != info.size.height &&
+        info.size.width == Common::AlignUp(info.size.height, 16U)) {
+        info.size.width = info.size.height;
+    }
     return FindRenderTargetView(info, gpu_addr);
 }
 
