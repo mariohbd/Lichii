@@ -209,6 +209,10 @@ private:
     bool TryNx2IndirectReset(bool is_indexed, u32 instance_count);
 
     void FlushWork();
+    /// submit_while_waited, at FlushWork's 32-draw check on the split back: submits the recorded
+    /// draws when the front waits for the back or the host GPU has caught up. True when it
+    /// submitted.
+    bool SubmitWhileWaited();
 
     void TraceRenderState(bool is_indexed, const char* outcome, const Framebuffer* framebuffer);
 
@@ -300,6 +304,12 @@ private:
     boost::container::static_vector<VkSampler, MAX_TEXTURES> sampler_handles;
 
     u32 draw_counter = 0;
+    /// submit_while_waited (EDEN_NX2_SUBMIT_WHILE_WAITED, read once, on unless "0") and its draw
+    /// minimums: while the front waits (EDEN_NX2_SUBMIT_WAITED_DRAWS, 64) and once the host GPU
+    /// is idle (EDEN_NX2_SUBMIT_IDLE_DRAWS, 128).
+    bool submit_while_waited{};
+    u32 submit_waited_draws{64};
+    u32 submit_idle_draws{128};
 #ifdef EGLANTINE_STREAMLINE
     std::optional<u64> oot_camera_sample_frame;
     struct OcarinaMotionTrace {
