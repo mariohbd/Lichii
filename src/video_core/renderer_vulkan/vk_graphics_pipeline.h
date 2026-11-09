@@ -270,6 +270,11 @@ private:
     bool ConfigureDraw(const RescalingPushConstant& rescaling,
                        const RenderAreaPushConstant& render_are);
 
+    /// Whether last_descriptor_payload holds a previous draw's num_descriptor_entries entries.
+    bool HasLastDescriptorPayload() const;
+    /// Remembers a draw's num_descriptor_entries descriptor entries in last_descriptor_payload.
+    void StoreLastDescriptorPayload(const DescriptorUpdateEntry* entries);
+
     struct PipelineStates;
 
     /// The fixed-function state of the pipeline (shared by the monolithic and library builds).
@@ -352,7 +357,10 @@ private:
     vk::Pipeline pipeline;
 
     DescriptorBufferLayout descriptor_buffer_layout;
+    /// With EDEN_NX2_DESC_SIZE_ONCE, sized once (num_descriptor_entries) so draws only copy into
+    /// it; valid once has_last_descriptor_payload is set.
     std::vector<DescriptorUpdateEntry> last_descriptor_payload;
+    bool has_last_descriptor_payload{};
     VkDeviceSize last_descriptor_buffer_offset{};
     u32 last_descriptor_buffer_chunk{};
     u64 last_descriptor_buffer_generation{};

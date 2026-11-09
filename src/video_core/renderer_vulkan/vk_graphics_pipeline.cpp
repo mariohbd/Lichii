@@ -55,6 +55,16 @@
 
 namespace Vulkan {
 namespace {
+// EDEN_NX2_DESC_SIZE_ONCE (default on): size the last descriptor payload once per pipeline, so
+// draws only copy into it instead of reassigning the vector. =0 restores the per-draw assign.
+bool DescSizeOnce() {
+    static const bool enabled = [] {
+        const char* v = std::getenv("EDEN_NX2_DESC_SIZE_ONCE");
+        return v == nullptr || v[0] != '0';
+    }();
+    return enabled;
+}
+
 // EDEN_NX2_DRAW_REUSE_PROBE=1: how often a draw's setup (pipeline, texture handles and samplers,
 // constant buffer addresses, vertex streams, render targets) repeats, from frame to frame and
 // from the previous draw of the same pipeline: whether caching it can pay. Logged every 120 frames.
@@ -499,6 +509,9 @@ GraphicsPipeline::GraphicsPipeline(
         num_image_elements += Shader::NumDescriptors(info->texture_descriptors);
         num_image_elements += Shader::NumDescriptors(info->image_descriptors);
         num_descriptor_entries += NumDescriptorEntries(*info);
+    }
+    if (DescSizeOnce()) {
+        last_descriptor_payload.resize(num_descriptor_entries);
     }
     fragment_has_color0_output = stage_infos[NUM_STAGES - 1].stores_frag_color[0];
     const auto any_written = [](const auto& descriptors) {
@@ -1394,6 +1407,22 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
     return configured;
 }
 
+bool GraphicsPipeline::HasLastDescriptorPayload() const {
+    if (DescSizeOnce()) {
+        return has_last_descriptor_payload;
+    }
+    return last_descriptor_payload.size() == num_descriptor_entries;
+}
+
+void GraphicsPipeline::StoreLastDescriptorPayload(const DescriptorUpdateEntry* entries) {
+    if (DescSizeOnce()) {
+        std::copy_n(entries, num_descriptor_entries, last_descriptor_payload.data());
+        has_last_descriptor_payload = true;
+    } else {
+        last_descriptor_payload.assign(entries, entries + num_descriptor_entries);
+    }
+}
+
 bool GraphicsPipeline::ConfigureDraw(const RescalingPushConstant& rescaling,
                                      const RenderAreaPushConstant& render_area) {
     if (guest_descriptor_queue.UpdateCount() != num_descriptor_entries) {
@@ -1409,7 +1438,7 @@ bool GraphicsPipeline::ConfigureDraw(const RescalingPushConstant& rescaling,
         const auto* const entries = static_cast<const DescriptorUpdateEntry*>(descriptor_data);
         const bool reuse_allocation =
             last_descriptor_buffer_generation == descriptor_buffer_ring.CurrentGeneration() &&
-            last_descriptor_payload.size() == num_descriptor_entries &&
+            HasLastDescriptorPayload() &&
             std::memcmp(last_descriptor_payload.data(), entries,
                         num_descriptor_entries * sizeof(DescriptorUpdateEntry)) == 0;
         if (reuse_allocation) {
@@ -1429,7 +1458,7 @@ bool GraphicsPipeline::ConfigureDraw(const RescalingPushConstant& rescaling,
             last_descriptor_buffer_offset = alloc.offset;
             last_descriptor_buffer_chunk = alloc.chunk;
             last_descriptor_buffer_generation = alloc.generation;
-            last_descriptor_payload.assign(entries, entries + num_descriptor_entries);
+            StoreLastDescriptorPayload(entries);
         }
     }
 
@@ -1477,11 +1506,11 @@ bool GraphicsPipeline::ConfigureDraw(const RescalingPushConstant& rescaling,
         has_stage_sets) {
         const auto* const entries = static_cast<const DescriptorUpdateEntry*>(descriptor_data);
         update_descriptors =
-            bind_pipeline || last_descriptor_payload.size() != num_descriptor_entries ||
+            bind_pipeline || !HasLastDescriptorPayload() ||
             std::memcmp(last_descriptor_payload.data(), entries,
                         num_descriptor_entries * sizeof(DescriptorUpdateEntry)) != 0;
         if (update_descriptors) {
-            last_descriptor_payload.assign(entries, entries + num_descriptor_entries);
+            StoreLastDescriptorPayload(entries);
         }
     }
     scheduler.Record([this, descriptor_data, bind_pipeline, update_descriptors,
