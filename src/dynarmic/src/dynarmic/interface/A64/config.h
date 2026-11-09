@@ -283,6 +283,11 @@ struct UserConfig {
     /// callbacks.
     bool recompile_on_exclusive_fastmem_failure = true;
 
+    /// x64 only. Conditional branches (b.cond, cbz/cbnz, tbz/tbnz) leave the block through an
+    /// out-of-line side exit and translation goes on with the next instruction (superblocks), so
+    /// guest registers stay in host registers across them.
+    bool superblocks = false;
+
     /// This option relates to translation. Generally when we run into an unpredictable
     /// instruction the ExceptionRaised callback is called. If this is true, we define
     /// definite behaviour for some unpredictable instructions.

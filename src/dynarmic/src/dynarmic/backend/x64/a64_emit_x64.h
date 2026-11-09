@@ -39,6 +39,8 @@ struct A64EmitContext final : public EmitContext {
     }
 
     const A64::UserConfig& conf;
+    /// Out-of-line tails of superblock side exits (see A64EmitX64::EmitSideExit).
+    std::vector<std::function<void()>> side_exit_emits;
 };
 
 class A64EmitX64 final : public EmitX64 {
@@ -70,6 +72,8 @@ public:
 
     // Microinstruction emitters
     void EmitPushRSB(EmitContext& ctx, IR::Inst* inst);
+    void EmitSideExit(A64EmitContext& ctx, SharedLabel exit, u64 target, u64 cycles);
+    bool EmitFusedSideExit(A64EmitContext& ctx, IR::Inst* test, IR::Inst* exit_inst);
 #define OPCODE(...)
 #define A32OPC(...)
 #define A64OPC(name, type, ...) void EmitA64##name(A64EmitContext& ctx, IR::Inst* inst);
