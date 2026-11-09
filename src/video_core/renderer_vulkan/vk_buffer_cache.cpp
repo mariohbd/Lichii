@@ -889,10 +889,10 @@ void BufferCacheRuntime::BindVertexBuffers(VideoCommon::HostBindings<Buffer>& bi
     }
     // The same buffers are still bound in this command buffer (as for index buffers): skip the
     // rebind. Draws re-resolve their vertex streams when the guest rewrites unchanged registers.
-    // EDEN_NX2_VB_BIND_SKIP=0 records every bind (zortos293/Lichii#955).
+    // Off by default in this build; EDEN_NX2_VB_BIND_SKIP=1 turns it on (zortos293/Lichii#955).
     static const bool vb_bind_skip = [] {
         const char* value = std::getenv("EDEN_NX2_VB_BIND_SKIP");
-        return value == nullptr || value[0] != '0';
+        return value != nullptr && value[0] == '1';
     }();
     if (vb_bind_skip && !VideoCommon::Nx2Perf::Verify()) {
         const u64 epoch = scheduler.RecordingEpoch();

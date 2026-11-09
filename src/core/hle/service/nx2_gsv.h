@@ -1902,11 +1902,11 @@ private:
     /// Whether presents return a release fence instead of holding the present thread until the
     /// vblank, as the console's compositor does. A game times its CPU frame across the present
     /// call, so a wait there reads as a slow CPU frame: Mario Kart World and Wonder NS2E then
-    /// chose their 30 fps mode and stayed there. EDEN_NX2_PRESENT_QUEUE=0 restores blocking pacing.
+    /// chose their 30 fps mode and stayed there. Off by default in this build; EDEN_NX2_PRESENT_QUEUE=1 turns it on.
     static bool PresentQueue() {
         static const bool enabled = [] {
             const char* value = std::getenv("EDEN_NX2_PRESENT_QUEUE");
-            return value == nullptr || value[0] != '0';
+            return value != nullptr && value[0] == '1';
         }();
         return enabled;
     }

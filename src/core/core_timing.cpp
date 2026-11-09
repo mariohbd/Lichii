@@ -134,12 +134,12 @@ void CoreTiming::Initialize(std::function<void()>&& on_thread_init_) {
                             // A high resolution timer keeps the guest's events (vsync among them)
                             // on time even where Windows doesn't honour our timer resolution
                             // request (Windows 11: players gained ~30% fps from making it global).
-                            // EDEN_NX2_WAITABLE_TIMER (default on): the timer sleeps all but the
+                            // EDEN_NX2_WAITABLE_TIMER=1 (default off): the timer sleeps all but the
                             // last 300 us, which the precise Event::WaitFor finishes, so events
-                            // are not late by the timer's ~0.5 ms granularity. =0: timer only.
+                            // are not late by the timer's ~0.5 ms granularity. Unset/0: timer only.
                             static const s64 precise_tail_ns = [] {
                                 const char* v = std::getenv("EDEN_NX2_WAITABLE_TIMER");
-                                return (v == nullptr || v[0] != '0') ? s64{300'000} : s64{0};
+                                return (v != nullptr && v[0] == '1') ? s64{300'000} : s64{0};
                             }();
                             bool slept = false;
                             if (wait_time > precise_tail_ns) {
