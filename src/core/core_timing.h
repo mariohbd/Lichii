@@ -9,6 +9,7 @@
 #include <atomic>
 #include <chrono>
 #include <functional>
+#include <limits>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -142,6 +143,9 @@ public:
 
     void Reset();
 
+    /// Whether the timer thread must be woken for an event at `time` (basic_lock held).
+    [[nodiscard]] bool NeedsWake(s64 time) const;
+
     using heap_t = boost::heap::fibonacci_heap<CoreTiming::Event, boost::heap::compare<std::greater<>>>;
     heap_t event_queue;
     s64 global_timer = 0;
@@ -152,6 +156,9 @@ public:
 #endif
     /// Wakes the timer thread: `event`, and on Windows the high resolution wait's wake handle.
     void Wake();
+    /// When the timer thread looks at the queue next: the minimum while it is in Advance, the
+    /// maximum while it waits on an empty queue (basic_lock).
+    s64 planned_wake{(std::numeric_limits<s64>::min)()};
     u64 event_fifo_id = 0;
     s64 pause_end_time{};
     /// Cycle timing

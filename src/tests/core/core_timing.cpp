@@ -7,6 +7,7 @@
 #include <bitset>
 #include <chrono>
 #include <cstdlib>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <string>
@@ -190,4 +191,33 @@ TEST_CASE("CoreTiming[DroppedEventType]", "[core]") {
     core_timing.AddTicks(1'000'000);
     REQUIRE_FALSE(core_timing.Advance().has_value());
     REQUIRE(later_ran);
+}
+
+TEST_CASE("CoreTiming[WakeOnlyWhenNeeded]", "[core]") {
+    // ScheduleEvent wakes the timer thread only for an event due before it looks at the queue
+    // again (planned_wake). EDEN_NX2_TIMING_SLEEP=0 wakes it every time.
+    const char* const sleep_switch = std::getenv("EDEN_NX2_TIMING_SLEEP");
+    if (sleep_switch != nullptr && sleep_switch[0] == '0') {
+        return;
+    }
+    Core::Timing::CoreTiming core_timing;
+    core_timing.SetMulticore(false);
+    core_timing.planned_wake = 1'000;
+    CHECK(core_timing.NeedsWake(999));
+    CHECK_FALSE(core_timing.NeedsWake(1'000));
+    CHECK_FALSE(core_timing.NeedsWake(5'000));
+
+    // Advance plans the next look: nothing queued means never, so any new event wakes it.
+    REQUIRE_FALSE(core_timing.Advance().has_value());
+    CHECK(core_timing.planned_wake == (std::numeric_limits<s64>::max)());
+    CHECK(core_timing.NeedsWake(1'000'000'000'000));
+    // With an event queued, it looks again when that event is due.
+    const auto later = Core::Timing::CreateEvent(
+        "later", [](s64, std::chrono::nanoseconds) { return std::nullopt; });
+    core_timing.ScheduleEvent(std::chrono::milliseconds{10}, later);
+    const auto next = core_timing.Advance();
+    REQUIRE(next.has_value());
+    CHECK(core_timing.planned_wake == *next);
+    CHECK_FALSE(core_timing.NeedsWake(*next + 1'000'000'000));
+    core_timing.UnscheduleEvent(later);
 }
