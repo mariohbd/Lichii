@@ -229,6 +229,10 @@ private:
     /// EDEN_NX2_ASYNC_DISCARD=2 only into recurring render targets). The one test BuiltPipeline
     /// and the translate queue both ask, answered once per lookup.
     [[nodiscard]] bool DrawMayBeSkipped() const;
+    /// EDEN_NX2_SHADER_BUILD_BUDGET: whether the current draw's new graphics pipeline is left
+    /// untranslated this frame (the GPU thread spent the frame's build budget and the draw may
+    /// be skipped). The draw is skipped; a later frame builds it.
+    [[nodiscard]] bool DeferRuntimeBuild();
     /// Counts CurrentGraphicsPipeline calls, so DrawMayBeSkipped classifies the targets once per
     /// lookup however often a lookup asks.
     u64 lookup_serial{};
@@ -509,6 +513,12 @@ private:
 
     /// Destroys graphics pipelines unused for a while, once the GPU is done with them.
     void EvictUnusedPipelines();
+    /// EDEN_NX2_SHADER_BUILD_BUDGET: start of the current budget window (the last present, or
+    /// 100 ms after it without one) and the frame's GPU-thread build time when it started.
+    /// GPU thread only.
+    std::chrono::steady_clock::time_point build_budget_start{};
+    std::chrono::steady_clock::duration build_budget_base{};
+    u64 deferred_builds{}; ///< Draws skipped over budget since the last log line
     /// Pipelines the disk cache held at boot (EDEN_NX2_PIPELINE_KEEP_BUDGET sizes the eviction
     /// threshold to it). Set by LoadDiskResources, read on the GPU thread.
     std::atomic<size_t> cached_at_boot_pipelines{0};

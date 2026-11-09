@@ -5063,6 +5063,13 @@ GraphicsPipeline* PipelineCache::CurrentGraphicsPipelineSlowPath() {
                 ++translate_stats.skipped;
                 return nullptr;
             }
+            // EDEN_NX2_SHADER_BUILD_BUDGET: past this frame's GPU-thread build budget, a draw
+            // that may be skipped is, and its pipeline is translated in a later frame.
+            if (DeferRuntimeBuild()) {
+                graphics_cache.erase(pair);
+                NoteSkippedLookup();
+                return nullptr;
+            }
             pipeline = CreateGraphicsPipeline();
         }
     } else if (!pipeline && translate_queue) {
@@ -5216,6 +5223,9 @@ void ReportTranslateProfile() {
 void PipelineCache::TickFrame() {
     ++frame_count;
     ReportWorstFrame();
+    // EDEN_NX2_SHADER_BUILD_BUDGET: ReportWorstFrame started the frame's tally anew.
+    build_budget_start = std::chrono::steady_clock::now();
+    build_budget_base = {};
     ReportAsyncDiscard();
     ReportTranslateProfile();
     if (PrecompiledFastMode() != 0) {
@@ -5252,6 +5262,13 @@ void PipelineCache::TickFrame() {
     constexpr u64 EvictCheckFrames = 600;
     if (frame_count % EvictCheckFrames == 0) {
         EvictUnusedPipelines();
+        if (deferred_builds != 0) {
+            LOG_INFO(Render_Vulkan,
+                     "Shader build budget: {} draws skipped and their pipelines built in a later "
+                     "frame in the last {} frames",
+                     deferred_builds, EvictCheckFrames);
+            deferred_builds = 0;
+        }
         if (VideoCore::Nx2Debug::Experiment(23) == 1 &&
             device.IsExtGraphicsPipelineLibrarySupported()) {
             // EXP23 (off by default, unmeasured): a library goes unused once every pipeline
@@ -5410,6 +5427,46 @@ int AsyncDiscardMode() {
         return parsed;
     }();
     return mode;
+}
+
+bool PipelineCache::DeferRuntimeBuild() {
+    // EDEN_NX2_SHADER_BUILD_BUDGET=<ms> (default 24; 0 = off; from A-Man-With-A-Plan-dev/Eglantine
+    // c9b8bb5e52 / e330d49488 via zortos293/Lichii 4553f1a100): GPU-thread time per frame for
+    // run-time pipeline builds (graphics translations and compute builds, as ReportRuntimePipeline
+    // counts them). Once a frame has spent it, a draw that may be skipped (DrawMayBeSkipped, the
+    // rule unbuilt pipelines and EDEN_NX2_ASYNC_TRANSLATE use) is skipped instead of translated
+    // on the GPU thread, so a burst of new content costs a few frames of missing draws instead
+    // of one long stall. With the asynchronous translation such draws already go to the
+    // translation threads; this covers the rest (its queue full, a key it gave up on, or
+    // EDEN_NX2_ASYNC_TRANSLATE=0). It needs asynchronous shaders.
+    static const std::chrono::steady_clock::duration budget = [] {
+        const char* const value = std::getenv("EDEN_NX2_SHADER_BUILD_BUDGET");
+        const int ms = value != nullptr ? std::max(0, std::atoi(value)) : 24;
+        if (ms != 0) {
+            LOG_INFO(Render_Vulkan,
+                     "Shader build budget: {} ms of run-time pipeline builds per frame", ms);
+        }
+        return std::chrono::steady_clock::duration{std::chrono::milliseconds{ms}};
+    }();
+    if (budget == std::chrono::steady_clock::duration::zero() || !use_asynchronous_shaders) {
+        return false;
+    }
+    if (frame_tally.builds - build_budget_base < budget) {
+        return false;
+    }
+    // No present for a while (a loading screen, off-screen work): a new window, so the skipped
+    // draws can't wait for a frame that doesn't come.
+    if (const auto now = std::chrono::steady_clock::now();
+        now - build_budget_start > std::chrono::milliseconds{100}) {
+        build_budget_start = now;
+        build_budget_base = frame_tally.builds;
+        return false;
+    }
+    if (!DrawMayBeSkipped()) {
+        return false;
+    }
+    ++deferred_builds;
+    return true;
 }
 
 bool PipelineCache::DrawMayBeSkipped() const {
