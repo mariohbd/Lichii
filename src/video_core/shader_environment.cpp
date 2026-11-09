@@ -545,7 +545,9 @@ Tegra::Texture::TICEntry GenericEnvironment::ReadTextureInfo(GPUVAddr tic_addr, 
         // under the shared lock. The GPU thread compares with a ReadBlock before using the result.
         ReadGuestGuarded(descriptor_addr, &entry, sizeof(entry));
     } else {
-        gpu_memory->ReadBlock(descriptor_addr, &entry, sizeof(entry));
+        // No cache flush for a descriptor read during translation either (Lichii #970): it could
+        // finish the whole GPU queue from the middle of a translation, stalling for seconds.
+        gpu_memory->ReadBlockUnsafe(descriptor_addr, &entry, sizeof(entry));
     }
     if (entry.format.Value() == Tegra::Texture::TextureFormat{} &&
         std::getenv("EDEN_NX2_RENDER_TRACE")) {
