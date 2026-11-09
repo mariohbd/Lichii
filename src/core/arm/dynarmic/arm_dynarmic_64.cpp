@@ -456,6 +456,18 @@ void ArmDynarmic64::MakeJit(Common::PageTable* page_table, std::size_t address_s
         config.fastmem_pointer = std::nullopt;
         config.fastmem_exclusive_access = false;
     }
+#if defined(ARCHITECTURE_x86_64)
+    // Superblocks: conditional branches (b.cond, cbz/cbnz, tbz/tbnz) become side exits and
+    // translation goes on, so guest registers stay in host registers across them.
+    // EDEN_NX2_JIT_SUPERBLOCKS=0 restores the block-ending conditional branches.
+    if (Settings::values.cpu_accuracy.GetValue() != Settings::CpuAccuracy::Paranoid) {
+        static const bool superblocks = [] {
+            const char* value = std::getenv("EDEN_NX2_JIT_SUPERBLOCKS");
+            return value == nullptr || value[0] != '0';
+        }();
+        config.superblocks = superblocks;
+    }
+#endif
     m_jit.emplace(config);
 }
 
