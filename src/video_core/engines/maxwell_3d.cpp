@@ -4,6 +4,7 @@
 // SPDX-FileCopyrightText: Copyright 2018 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <cstdlib>
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -1324,6 +1325,17 @@ bool IsOtherIndexDraw(u32 method) {
     }
 }
 
+// Frizti/Fritchii#35: a macro DMA read of pages the GPU never wrote, with no 3D report to it still
+// unsent to the back thread, skips the drain and the query flush. Off by default (not checked
+// read by read against the full path); EDEN_NX2_FAST_DMA_READ=1 turns it on.
+bool FastDmaRead() {
+    static const bool enabled = [] {
+        const char* const value = std::getenv("EDEN_NX2_FAST_DMA_READ");
+        return value != nullptr && value[0] == '1';
+    }();
+    return enabled;
+}
+
 std::unordered_map<GPUVAddr, u64>& FrontReportSlots() {
     static std::unordered_map<GPUVAddr, u64> slots;
     return slots;
@@ -2000,7 +2012,9 @@ void Maxwell3D::FrontNoteMemoryWrite(VideoCommon::GpuSplit& split, FrontState& f
             // the host query completed.
             split.NoteAsyncWrite(*device, 16);
             split.NoteMemoryWrite(*device, 16, "3D report");
-            FrontReportSlots()[address & ~GPUVAddr{0xf}] = split.SentPosition();
+            if (FastDmaRead()) {
+                FrontReportSlots()[address & ~GPUVAddr{0xf}] = split.SentPosition();
+            }
         }
         return;
     }
@@ -2327,7 +2341,7 @@ void Maxwell3D::FrontDmaRead(VideoCommon::GpuSplit& split, FrontState& fs, u32 m
     }
     VideoCommon::Nx2Profile::CountDmaRead(macro);
     bool fast = false;
-    if (!full_drain && !Tegra::Nx2CmdPageDiag::g_enabled &&
+    if (FastDmaRead() && !full_drain && !Tegra::Nx2CmdPageDiag::g_enabled &&
         !VideoCommon::QueryDma::TraceEnabled()) {
         bool may_gpu_written = false;
         for (GPUVAddr page = source & ~GPUVAddr{0xfff}; page < source + read_bytes;
