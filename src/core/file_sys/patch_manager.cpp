@@ -65,7 +65,26 @@ struct BuiltinPatch {
     /// When set, the patch applies only while this environment variable is 1 (A/B before it
     /// becomes a default).
     const char* enable_env = nullptr;
+    /// When set, the patch applies unless this environment variable starts with 0.
+    const char* disable_env = nullptr;
 };
+
+/// Whether the environment switches of a built-in patch let it apply.
+bool BuiltinPatchSwitchedOn(const BuiltinPatch& patch) {
+    if (patch.enable_env != nullptr) {
+        const char* const value = std::getenv(patch.enable_env);
+        if (value == nullptr || std::string_view{value} != "1") {
+            return false;
+        }
+    }
+    if (patch.disable_env != nullptr) {
+        const char* const value = std::getenv(patch.disable_env);
+        if (value != nullptr && value[0] == '0') {
+            return false;
+        }
+    }
+    return true;
+}
 
 // Ocarina of Time takes its "dynamic resolution disabled" path, so the 3D renders at full scale
 // instead of following the GPU-time controller down to its 480p floor.
@@ -128,6 +147,26 @@ constexpr std::array POLL_BACKOFF_RECORDS{
     BuiltinPatchRecord{.module_offset = 0x1708C, .bytes = POLL_BACKOFF_RETURN, .checked = true, .original = 0},
 };
 
+// RsMan-Dev's texture pool patch (#247): with Max Resolution the render targets outgrow the
+// graphics allocator's initial pool and the Castle Town guard house dereferences a null
+// allocation (main+0x403f0). stp x8, x9, [sp, #0x10] at main+0xC2A36C stores the initial pool
+// size (x8); it now calls a routine in the padding after the code (bl 0x3c462c0) that doubles it
+// first (lsl x8, x8, #1 ; stp ; ret).
+constexpr std::array<u8, 4> TEXTURE_POOL_CALL{0xD5, 0x6F, 0xC0, 0x94};
+constexpr std::array<u8, 12> TEXTURE_POOL_ROUTINE{
+    0x08, 0xF9, 0x7F, 0xD3, 0xE8, 0x27, 0x01, 0xA9, 0xC0, 0x03, 0x5F, 0xD6,
+};
+constexpr std::array TEXTURE_POOL_RECORDS{
+    BuiltinPatchRecord{.module_offset = 0xC2A36C,
+                       .bytes = TEXTURE_POOL_CALL,
+                       .checked = true,
+                       .original = 0xA90127E8}, // stp x8, x9, [sp, #0x10]
+    BuiltinPatchRecord{.module_offset = 0x3C462C0,
+                       .bytes = TEXTURE_POOL_ROUTINE,
+                       .checked = true,
+                       .original = 0},
+};
+
 constexpr std::array BUILTIN_PATCHES{
     BuiltinPatch{
         .name = "Max Resolution (built-in)",
@@ -158,6 +197,15 @@ constexpr std::array BUILTIN_PATCHES{
         .build_id = "E0F3CCFAF50065AE4EA01EB5AEB13B1A45DA3348",
         .records = POLL_BACKOFF_RECORDS,
         .enable_env = "EDEN_NX2_OOT_POLL_BACKOFF",
+    },
+    // EDEN_NX2_OOT_GUARDHOUSE_FIX=0 leaves the initial pool as the game sizes it.
+    BuiltinPatch{
+        .name = "Texture Pool x2 (built-in)",
+        .title_id = 0x0400486024DEC000,
+        .module = "main",
+        .build_id = "E0F3CCFAF50065AE4EA01EB5AEB13B1A45DA3348",
+        .records = TEXTURE_POOL_RECORDS,
+        .disable_env = "EDEN_NX2_OOT_GUARDHOUSE_FIX",
     },
 };
 
@@ -584,11 +632,8 @@ std::vector<u8> PatchManager::PatchNSO(const std::vector<u8>& nso, const std::st
         if (patch.title_id != title_id || patch.module != name) {
             continue;
         }
-        if (patch.enable_env != nullptr) {
-            const char* const value = std::getenv(patch.enable_env);
-            if (value == nullptr || std::string_view{value} != "1") {
-                continue;
-            }
+        if (!BuiltinPatchSwitchedOn(patch)) {
+            continue;
         }
         if (std::find(disabled.cbegin(), disabled.cend(), patch.name) != disabled.cend()) {
             LOG_INFO(Loader, "    - Skipping \"{}\": disabled in Add-Ons", patch.name);
@@ -1200,10 +1245,7 @@ std::vector<Patch> PatchManager::GetPatches(VirtualFile update_raw) const {
     }
 
     for (const auto& patch : BUILTIN_PATCHES) {
-        if (patch.title_id != title_id ||
-            (patch.enable_env != nullptr &&
-             std::string_view{std::getenv(patch.enable_env) ? std::getenv(patch.enable_env) : ""} !=
-                 "1")) {
+        if (patch.title_id != title_id || !BuiltinPatchSwitchedOn(patch)) {
             continue;
         }
         const auto patch_disabled =
