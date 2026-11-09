@@ -989,6 +989,29 @@ void RasterizerVulkan::Draw(bool is_indexed, u32 instance_count) {
                      regs.blend.enable[0], seen.size());
         }
     }
+    // EDEN_NX2_SKIP_EMPTY_DRAWS (default on): a direct draw with no vertices, or no instances
+    // outside task/mesh pipelines, records nothing. Skip it before the pipeline, buffer and
+    // descriptor work: dirty state, deferred clears and query counter toggles stay pending for the
+    // next recorded draw, clear or render pass end, which apply them before anything can observe
+    // them. With transform feedback on, or a vertex count the GPU wrote, the draw goes through.
+    static const bool skip_empty_draws = [] {
+        const char* v = std::getenv("EDEN_NX2_SKIP_EMPTY_DRAWS");
+        return v == nullptr || v[0] != '0';
+    }();
+    if (skip_empty_draws && !gpu_count && maxwell3d->regs.transform_feedback_enabled == 0 &&
+        (MakeDrawParams(maxwell3d->draw_manager.draw_state, instance_count, is_indexed)
+                 .num_vertices == 0 ||
+         (instance_count == 0 && [this] {
+             const GraphicsPipeline* const pipeline = pipeline_cache.CurrentGraphicsPipeline();
+             return pipeline != nullptr && !pipeline->IsMeshPipeline();
+         }()))) {
+        if (Common::DkbFrameTrace::Enabled()) {
+            ++trace_draws;
+            ++trace_zero_direct;
+        }
+        gpu.TickWork();
+        return;
+    }
     PrepareDraw(is_indexed, [this, is_indexed, instance_count, gpu_count] {
         const auto& draw_state = maxwell3d->draw_manager.draw_state;
         const u32 num_instances{instance_count};
