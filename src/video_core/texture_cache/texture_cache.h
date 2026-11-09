@@ -3773,6 +3773,16 @@ ImageId TextureCache<P>::JoinImages(const ImageInfo& info, GPUVAddr gpu_addr, DA
             }
         }
     }
+    // EDEN_NX2_RSMAN_VRAM_LAZY_ORIGINAL (zortos293/Lichii#267): a new render target with nothing
+    // to take from another image only ever uses its scaled image: its unscaled one was bound to
+    // memory for nothing and blitted from with no contents. It starts scaled, with the unscaled
+    // image made if something asks for it (an upload, a download, going back to 1x).
+    static const bool lazy_original = RsManVram::Enabled("EDEN_NX2_RSMAN_VRAM_LAZY_ORIGINAL");
+    new_info.scaled_only = lazy_original && inserting_render_target && new_info.rescaleable &&
+                           !new_info.is_sparse && new_info.type == ImageType::e2D &&
+                           new_info.num_samples == 1 &&
+                           Settings::values.resolution_info.active && join_copies_to_do.empty() &&
+                           !IsPixelFormatASTC(new_info.format) && !IsPixelFormatBCn(new_info.format);
     const auto create_start = std::chrono::steady_clock::now();
     const ImageId new_image_id = slot_images.insert(runtime, new_info, gpu_addr, cpu_addr);
     rt_stats.create_ns += NsSince(create_start);
@@ -3796,6 +3806,14 @@ ImageId TextureCache<P>::JoinImages(const ImageInfo& info, GPUVAddr gpu_addr, DA
     }
     Image& new_image = slot_images[new_image_id];
     ++bindings_epoch;
+    new_image.info.scaled_only = false; // read by the constructor only
+    bool started_scaled = false;
+    if constexpr (requires { new_image.StartScaled(); }) {
+        started_scaled = new_image.StartScaled();
+        if (started_scaled) {
+            total_used_memory += GetScaledImageSizeBytes(new_image);
+        }
+    }
 
     new_image.allocation_tick = frame_tick;
     {
@@ -3989,7 +4007,7 @@ ImageId TextureCache<P>::JoinImages(const ImageInfo& info, GPUVAddr gpu_addr, DA
 
     if (can_rescale) {
         ScaleUp(new_image);
-    } else {
+    } else if (!started_scaled) {
         ScaleDown(new_image);
     }
 

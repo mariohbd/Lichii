@@ -50,6 +50,9 @@ struct ImageInfo {
     u32 tile_width_spacing = 0;
     bool native_tiling = false;
     bool rescaleable = false;
+    /// EDEN_NX2_RSMAN_VRAM_LAZY_ORIGINAL: start at the scaled size, with the unscaled image made
+    /// only if something asks for it (an upload, a download, going back to 1x).
+    bool scaled_only = false;
     bool downscaleable = false;
     bool forced_flushed = false;
     bool dma_downloaded = false;
