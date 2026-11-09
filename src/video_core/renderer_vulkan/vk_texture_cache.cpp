@@ -5187,6 +5187,8 @@ void TextureCacheRuntime::TranscodeAstcToBcn(
                           image.gpu_addr, width, height, levels);
             }
             image.flags |= VideoCommon::ImageFlagBits::CpuModified;
+            // It holds nothing of this data: the next refresh must upload it whatever its hash.
+            image.content_hashed = false;
             TransitionImageLayout(image);
             return;
         }

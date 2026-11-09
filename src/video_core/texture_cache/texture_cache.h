@@ -22,6 +22,7 @@
 #include <boost/container/small_vector.hpp>
 
 #include "common/alignment.h"
+#include "common/cityhash.h"
 #include "common/memory_detect.h"
 #include "common/scope_exit.h"
 #include "common/settings.h"
@@ -2580,6 +2581,9 @@ void TextureCache<P>::RefreshContents(Image& image, ImageId image_id) {
         runtime.TransitionImageLayout(image);
         return;
     }
+    if (ContentUnchanged(image)) {
+        return;
+    }
     if (True(image.flags & ImageFlagBits::AsynchronousDecode)) {
         QueueAsyncDecode(image, image_id);
         return;
@@ -2650,6 +2654,44 @@ void TextureCache<P>::RefreshContents(Image& image, ImageId image_id) {
             uploaded_ranges.emplace_back(image.cpu_addr, image.guest_size_bytes);
         }
     }
+}
+
+// A game can write the same data over a texture again: on Pokopia's title, 99.9 % of the images
+// uploaded again were identical, 12 GB in two minutes. Reading the data to hash it costs about what
+// reading it to upload does, so this saves the GPU's copy rather than CPU time, and only pays for
+// images that come back: a first refresh records the hash, one that keeps changing is left alone.
+// EDEN_NX2_TC_SKIP_SAME_UPLOAD=0 (read once) always uploads, as v5.1 did.
+template <class P>
+bool TextureCache<P>::ContentUnchanged(Image& image) {
+    static const bool enabled = [] {
+        const char* v = std::getenv("EDEN_NX2_TC_SKIP_SAME_UPLOAD");
+        return v == nullptr || v[0] != '0';
+    }();
+    if (!enabled) {
+        return false;
+    }
+    static constexpr u32 PatienceChanges = 4;
+    static constexpr u32 RetryRefreshes = 64;
+    static constexpr u64 MaxHashedBytes = 64_MiB; // A hitch of its own past this
+    const u32 refresh = image.content_refreshes++;
+    if (refresh == 0 || image.guest_size_bytes > MaxHashedBytes ||
+        True(image.flags & ImageFlagBits::Sparse) || UploadsByLayer(image) ||
+        (image.content_changes >= PatienceChanges && refresh % RetryRefreshes > 1)) {
+        // What goes up now isn't what was hashed.
+        image.content_hashed = false;
+        return false;
+    }
+    Tegra::Memory::GpuGuestMemory<u8, Tegra::Memory::GuestMemoryFlags::UnsafeRead> guest(
+        *gpu_memory, image.gpu_addr, image.guest_size_bytes, &swizzle_data_buffer);
+    const u64 hash = Common::CityHash64(reinterpret_cast<const char*>(guest.data()), guest.size());
+    // Whatever else wrote to the image on the host, a draw or a copy, moved its tick.
+    const bool same = image.content_hashed && hash == image.content_hash &&
+                      image.modification_tick == image.content_tick;
+    image.content_hashed = true;
+    image.content_hash = hash;
+    image.content_tick = image.modification_tick;
+    image.content_changes = same ? 0 : image.content_changes + 1;
+    return same;
 }
 
 template <class P>

@@ -132,6 +132,13 @@ struct ImageBase {
     u64 newest_alias_tick = 0;
     size_t lru_index = SIZE_MAX;
 
+    // See TextureCache::ContentUnchanged.
+    u64 content_hash = 0;
+    u64 content_tick = 0;
+    u32 content_refreshes = 0;
+    u32 content_changes = 0;
+    bool content_hashed = false;
+
     /// Render target relocation guard (EXP43): the frame the GPU last wrote the image (~0 =
     /// never, or contents discarded), and the guard reasons this image already reported.
     u64 last_write_frame = ~u64{0};
