@@ -10,6 +10,7 @@
 #include <cstddef>
 #include <cstdlib>
 #include <cstring>
+#include <optional>
 
 #include "common/assert.h"
 #include "common/hex_util.h"
@@ -67,6 +68,9 @@ struct BuiltinPatch {
     const char* enable_env = nullptr;
     /// When set, the patch applies unless this environment variable starts with 0.
     const char* disable_env = nullptr;
+    /// When set, the patch applies only with this NVIDIA DLSS mode chosen and is not listed in
+    /// Add-Ons.
+    std::optional<Settings::OcarinaDlssMode> render_scale{};
 };
 
 /// Whether the environment switches of a built-in patch let it apply.
@@ -94,6 +98,32 @@ constexpr std::array MAX_RESOLUTION_RECORDS{
                        .bytes = MAX_RESOLUTION_BRANCH,
                        .checked = true,
                        .original = 0x360041E8}, // tbz w8, #0, 0x80640c
+};
+
+// Render scale for "NVIDIA DLSS mode in Ocarina of Time", on top of Max Resolution: its
+// fixed-scale path returns 1.0 of 2560x1440 (main+0x806420: mov w9, #0x3f800000). Quality keeps
+// it; the other modes load a lower scale.
+constexpr u32 RENDER_SCALE_ONE = 0x52A7F009;                                  // #0x3f800000, 1.0
+constexpr std::array<u8, 4> RENDER_SCALE_BALANCED{0xE9, 0xEB, 0xA7, 0x52};    // #0x3f5f0000, ~1254p
+constexpr std::array<u8, 4> RENDER_SCALE_PERFORMANCE{0x09, 0xE8, 0xA7, 0x52}; // #0x3f400000, 1080p
+constexpr std::array<u8, 4> RENDER_SCALE_ULTRA{0x09, 0xE0, 0xA7, 0x52};       // #0x3f000000, 720p
+constexpr std::array RENDER_BALANCED_RECORDS{
+    BuiltinPatchRecord{.module_offset = 0x806420,
+                       .bytes = RENDER_SCALE_BALANCED,
+                       .checked = true,
+                       .original = RENDER_SCALE_ONE},
+};
+constexpr std::array RENDER_PERFORMANCE_RECORDS{
+    BuiltinPatchRecord{.module_offset = 0x806420,
+                       .bytes = RENDER_SCALE_PERFORMANCE,
+                       .checked = true,
+                       .original = RENDER_SCALE_ONE},
+};
+constexpr std::array RENDER_ULTRA_RECORDS{
+    BuiltinPatchRecord{.module_offset = 0x806420,
+                       .bytes = RENDER_SCALE_ULTRA,
+                       .checked = true,
+                       .original = RENDER_SCALE_ONE},
 };
 
 // Dynamic FPS by Dark (Eglantine Dev), bundled with his permission: the game's frame step follows
@@ -174,6 +204,31 @@ constexpr std::array BUILTIN_PATCHES{
         .module = "main",
         .build_id = "E0F3CCFAF50065AE4EA01EB5AEB13B1A45DA3348",
         .records = MAX_RESOLUTION_RECORDS,
+    },
+    // Lower render scales under Max Resolution, chosen by Settings ocarina_dlss_mode.
+    BuiltinPatch{
+        .name = "DLSS Balanced render scale (built-in)",
+        .title_id = 0x0400486024DEC000,
+        .module = "main",
+        .build_id = "E0F3CCFAF50065AE4EA01EB5AEB13B1A45DA3348",
+        .records = RENDER_BALANCED_RECORDS,
+        .render_scale = Settings::OcarinaDlssMode::Balanced,
+    },
+    BuiltinPatch{
+        .name = "DLSS Performance render scale (built-in)",
+        .title_id = 0x0400486024DEC000,
+        .module = "main",
+        .build_id = "E0F3CCFAF50065AE4EA01EB5AEB13B1A45DA3348",
+        .records = RENDER_PERFORMANCE_RECORDS,
+        .render_scale = Settings::OcarinaDlssMode::Performance,
+    },
+    BuiltinPatch{
+        .name = "DLSS Ultra Performance render scale (built-in)",
+        .title_id = 0x0400486024DEC000,
+        .module = "main",
+        .build_id = "E0F3CCFAF50065AE4EA01EB5AEB13B1A45DA3348",
+        .records = RENDER_ULTRA_RECORDS,
+        .render_scale = Settings::OcarinaDlssMode::UltraPerformance,
     },
     BuiltinPatch{
         .name = "Dynamic FPS by Dark (built-in)",
@@ -634,6 +689,17 @@ std::vector<u8> PatchManager::PatchNSO(const std::vector<u8>& nso, const std::st
         }
         if (!BuiltinPatchSwitchedOn(patch)) {
             continue;
+        }
+        if (patch.render_scale) {
+#ifdef EGLANTINE_STREAMLINE
+            if (!Settings::values.nvidia_dlss.GetValue() ||
+                *patch.render_scale != Settings::values.ocarina_dlss_mode.GetValue()) {
+                continue;
+            }
+#else
+            // A shared config can carry the setting into a build without DLSS.
+            continue;
+#endif
         }
         if (std::find(disabled.cbegin(), disabled.cend(), patch.name) != disabled.cend()) {
             LOG_INFO(Loader, "    - Skipping \"{}\": disabled in Add-Ons", patch.name);
@@ -1334,7 +1400,7 @@ std::vector<Patch> PatchManager::GetPatches(VirtualFile update_raw) const {
     }
 
     for (const auto& patch : BUILTIN_PATCHES) {
-        if (patch.title_id != title_id || !BuiltinPatchSwitchedOn(patch)) {
+        if (patch.title_id != title_id || !BuiltinPatchSwitchedOn(patch) || patch.render_scale) {
             continue;
         }
         const auto patch_disabled =
