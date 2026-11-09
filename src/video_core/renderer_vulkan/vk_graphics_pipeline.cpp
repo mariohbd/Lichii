@@ -514,6 +514,20 @@ GraphicsPipeline::GraphicsPipeline(
         last_descriptor_payload.resize(num_descriptor_entries);
     }
     fragment_has_color0_output = stage_infos[NUM_STAGES - 1].stores_frag_color[0];
+    // EDEN_NX2_COLOR_MASK_TRIM (default on; Lichii #353): the guest leaves render target
+    // components the fragment shader doesn't output untouched, while Vulkan writes undefined
+    // values to them (AMD writes garbage), so they are masked out. =0 writes them as v5.1 did.
+    static const bool color_mask_trim = [] {
+        const char* v = std::getenv("EDEN_NX2_COLOR_MASK_TRIM");
+        return v == nullptr || v[0] != '0';
+    }();
+    if (color_mask_trim) {
+        color_output_mask = 0;
+        for (size_t rt = 0; rt < Maxwell::NumRenderTargets; ++rt) {
+            color_output_mask |= u32{stage_infos[NUM_STAGES - 1].frag_color_components[rt]}
+                                 << (rt * 4);
+        }
+    }
     const auto any_written = [](const auto& descriptors) {
         return std::ranges::any_of(descriptors, [](const auto& desc) { return desc.is_written; });
     };
@@ -1880,6 +1894,7 @@ void GraphicsPipeline::FillStates(PipelineStates& s) const {
         for (size_t i = 0; i < mask_table.size(); ++i) {
             write_mask |= mask[i] ? mask_table[i] : 0;
         }
+        write_mask &= ColorOutputMask(index);
         cb_attachments.push_back({
             .blendEnable = blend.enable != 0,
             .srcColorBlendFactor = MaxwellToVK::BlendFactor(blend.SourceRGBFactor()),
