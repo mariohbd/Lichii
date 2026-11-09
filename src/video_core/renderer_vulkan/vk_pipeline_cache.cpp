@@ -1209,6 +1209,28 @@ size_t EvictAbovePipelines() {
     return evict_above;
 }
 
+/// EDEN_NX2_PIPELINE_KEEP_BUDGET (default on; from zortos293/Lichii#994): the eviction threshold
+/// also fits the disk cache loaded at boot, the whole cache plus 1024 for new content, at most
+/// 12,288 (~5.5 GB of driver memory), so the cache's own pipelines are not evicted and built
+/// again on the GPU thread (OoT, 7,316 cached with a limit of 4,096: 3,925 evicted, 1,395
+/// rebuilt). Never below EvictAbovePipelines; an explicit EDEN_NX2_PIPELINE_EVICT_ABOVE wins.
+/// =0 keeps v5.1's fixed threshold.
+size_t EvictAbovePipelinesForCache(size_t cached_at_boot) {
+    static const bool enabled = [] {
+        const char* v = std::getenv("EDEN_NX2_PIPELINE_KEEP_BUDGET");
+        return v == nullptr || v[0] != '0';
+    }();
+    static const bool forced = std::getenv("EDEN_NX2_PIPELINE_EVICT_ABOVE") != nullptr;
+    const size_t evict_above = EvictAbovePipelines();
+    if (!enabled || forced) {
+        return evict_above;
+    }
+    constexpr size_t NewContentPipelines = 1024;
+    constexpr size_t MaxKeptPipelines = 12288;
+    const size_t for_cache = std::min(cached_at_boot + NewContentPipelines, MaxKeptPipelines);
+    return std::max(evict_above, for_cache);
+}
+
 /// How many of the cached graphics pipelines boot skipped the background builds, newest first;
 /// the rest are built when a draw first needs them. A cache merged from a community pack held
 /// 60k pipelines: building all of them took 15 minutes on 6 threads and, at ~0.45 MB each, held
@@ -2817,6 +2839,7 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
     }
 
     LOG_INFO(Render_Vulkan, "Total Pipeline Count: {}", state.total);
+    cached_at_boot_pipelines.store(state.total, std::memory_order::relaxed);
     if (foreign_records != 0) {
         LOG_INFO(Render_Vulkan,
                  "{} cached graphics pipeline records were stored by another GPU driver{}",
@@ -5270,7 +5293,8 @@ void PipelineCache::EvictUnusedPipelines() {
     // pipelines are ~3.6 GB of driver memory at most. EDEN_NX2_PIPELINE_EVICT_ABOVE sets it.
     // Past it only the excess goes, least recently used first (from zortos293/Lichii#408), so
     // crossing it doesn't drop every stale pipeline at once.
-    const size_t evict_above = EvictAbovePipelines();
+    const size_t evict_above = EvictAbovePipelinesForCache(
+        cached_at_boot_pipelines.load(std::memory_order::relaxed));
     if (graphics_cache.size() <= evict_above) {
         return;
     }

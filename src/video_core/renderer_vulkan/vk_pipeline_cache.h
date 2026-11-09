@@ -509,6 +509,9 @@ private:
 
     /// Destroys graphics pipelines unused for a while, once the GPU is done with them.
     void EvictUnusedPipelines();
+    /// Pipelines the disk cache held at boot (EDEN_NX2_PIPELINE_KEEP_BUDGET sizes the eviction
+    /// threshold to it). Set by LoadDiskResources, read on the GPU thread.
+    std::atomic<size_t> cached_at_boot_pipelines{0};
     u64 frame_count{};
     std::deque<std::pair<u64, std::unique_ptr<GraphicsPipeline>>> evicted_pipelines; ///< (tick, pipeline)
     /// Pipelines the translate queue did not use (discarded, stale, abandoned, rejected by the
