@@ -1659,7 +1659,18 @@ void BufferCache<P>::BindHostGraphicsUniformBuffer(size_t stage, u32 index, u32 
     const bool use_fast_buffer = needs_alignment_stream
         || (has_host_buffer && size <= channel_state->uniform_buffer_skip_cache_size
             && !memory_tracker.IsRegionGpuModified(device_addr, size));
-    const bool native_bank_bind = has_host_buffer &&
+    // EDEN_NX2_OOT_BANK_SKIP=1 (zortos293/Lichii#909, opt-in here): Ocarina of Time skips the
+    // bank check (unless EDEN_NX2_PERF_VERIFY=1). Lichii found no page of its banks changed behind
+    // the tracker, but Eglantine 031e07436c measured white flashes in it with a check only once a
+    // frame, so v5.1 keeps checking by default.
+    constexpr u64 ocarina_of_time = 0x0400486024DEC000ULL;
+    static const bool oot_bank_skip = [] {
+        const char* value = std::getenv("EDEN_NX2_OOT_BANK_SKIP");
+        return value != nullptr && value[0] != '0';
+    }();
+    const bool bank_recheck =
+        !oot_bank_skip || program_id != ocarina_of_time || Nx2Perf::Verify();
+    const bool native_bank_bind = bank_recheck && has_host_buffer &&
                                   (*channel_state->uniform_buffer_sizes)[stage][index] == 0x10000 &&
                                   size != 0 && gpu_memory != nullptr &&
                                   gpu_memory->UsesNativeTiling() &&
