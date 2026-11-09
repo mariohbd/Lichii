@@ -2441,18 +2441,73 @@ void BufferCache<P>::UpdateIndexBuffer() {
 
     const GPUVAddr gpu_addr_begin = index_buffer_ref.StartAddress();
     const GPUVAddr gpu_addr_end = index_buffer_ref.EndAddress();
-    const std::optional<DAddr> device_addr = gpu_memory->GpuToCpuAddress(gpu_addr_begin);
     const u32 address_size = static_cast<u32>(gpu_addr_end - gpu_addr_begin);
     const u32 draw_size = (index_buffer_ref.count + index_buffer_ref.first) * u32(index_buffer_ref.FormatSizeInBytes());
     const u32 size = (std::min)(address_size, draw_size);
+    // EDEN_NX2_IB_KEEP (zortos293/Lichii#954, default on, 0 = off): the draw macros mark the
+    // index buffer dirty on every draw, mostly with the same buffer and another count: the
+    // address and the buffer found are kept while the range, the GPU mappings and the set of
+    // buffers (binding_epoch) are, for any size up to the one the buffer was found for. Not with
+    // accurate GPU fences: FindBuffer waits for writes there.
+    static const bool ib_keep = [] {
+        const char* value = std::getenv("EDEN_NX2_IB_KEEP");
+        return value == nullptr || value[0] != '0';
+    }();
+    IndexBufferMemo& memo = index_buffer_memo;
+    // Before the translation: a map in between makes the memo miss next time.
+    const u64 map_serial = gpu_memory->MapSerial();
+    const bool memo_hit = ib_keep && memo.epoch == binding_epoch &&
+                          memo.channel == static_cast<const void*>(channel_state) &&
+                          memo.memory == static_cast<const void*>(gpu_memory) &&
+                          memo.begin == gpu_addr_begin && memo.end == gpu_addr_end &&
+                          memo.map_serial == map_serial && size != 0 &&
+                          size <= memo.found_size && !Settings::IsGPUFenceBehaviorAccurate();
+    if (memo_hit && !Nx2Perf::Verify()) {
+        channel_state->index_buffer = Binding{
+            .device_addr = memo.device_addr,
+            .size = size,
+            .buffer_id = memo.buffer_id,
+        };
+        return;
+    }
+    const std::optional<DAddr> device_addr = gpu_memory->GpuToCpuAddress(gpu_addr_begin);
     if (size == 0 || !device_addr) {
         channel_state->index_buffer = NULL_BINDING;
         return;
     }
+    const BufferId buffer_id = FindBuffer(*device_addr, size, false);
     channel_state->index_buffer = Binding{
         .device_addr = *device_addr,
         .size = size,
-        .buffer_id = FindBuffer(*device_addr, size, false),
+        .buffer_id = buffer_id,
+    };
+    if (memo_hit) {
+        if (memo.device_addr != *device_addr || memo.buffer_id != buffer_id) {
+            static std::atomic<u32> reports{};
+            if (reports.fetch_add(1, std::memory_order_relaxed) < 16) {
+                LOG_ERROR(HW_GPU,
+                          "Nx2Perf index buffer memo mismatch: {:#x}+{:#x} kept {:#x} buffer {}, "
+                          "found {:#x} buffer {}",
+                          gpu_addr_begin, size, memo.device_addr, memo.buffer_id.index,
+                          *device_addr, buffer_id.index);
+            }
+        }
+        return;
+    }
+    if (!ib_keep) {
+        return;
+    }
+    // binding_epoch after the lookup: a buffer FindBuffer created or joined is part of the memo.
+    memo = IndexBufferMemo{
+        .epoch = binding_epoch,
+        .map_serial = map_serial,
+        .channel = channel_state,
+        .memory = gpu_memory,
+        .begin = gpu_addr_begin,
+        .end = gpu_addr_end,
+        .device_addr = *device_addr,
+        .found_size = size,
+        .buffer_id = buffer_id,
     };
 }
 

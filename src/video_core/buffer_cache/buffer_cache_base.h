@@ -955,6 +955,20 @@ private:
     std::array<std::array<StorageBindingMemo, NUM_STORAGE_BUFFERS>, NUM_STAGES + 1>
         storage_binding_memo{};
 
+    /// EDEN_NX2_IB_KEEP: the last index buffer UpdateIndexBuffer resolved, and what it depends on.
+    struct IndexBufferMemo {
+        u64 epoch{}; ///< binding_epoch when stored; 0 never matches
+        u64 map_serial{};
+        const void* channel{};
+        const void* memory{};
+        GPUVAddr begin{};
+        GPUVAddr end{};
+        DAddr device_addr{};
+        u32 found_size{}; ///< The size FindBuffer was asked for: the buffer holds at least this
+        BufferId buffer_id{};
+    };
+    IndexBufferMemo index_buffer_memo;
+
     /// FindBuffer and ResolveMultiRangeStorage for one storage binding, from its memo when
     /// nothing they depend on changed.
     void ResolveStorageBinding(size_t memo_stage, u32 index, Binding& binding, bool is_written,
