@@ -7,6 +7,7 @@
 #include <version>
 #if __cpp_lib_chrono >= 201907L
 #include <chrono>
+#include <cstdlib>
 #include <exception>
 #include <stdexcept>
 #endif
@@ -403,8 +404,14 @@ u32 FrameGenMultiplier() {
 }
 
 bool FrameGenActive() {
-    static const bool fritchii = std::string_view{Common::g_build_name} == "Fritchii";
-    return values.frame_gen.GetValue() && !fritchii;
+    // v5.5 turned frame generation off in every Fritchii build (an old frame_gen=true left in
+    // configs made the camera flicker). This build shows the setting in Graphics again and runs
+    // it as v5.3 did; EDEN_NX2_FRAMEGEN=0 keeps it off whatever the setting says.
+    static const bool allowed = [] {
+        const char* v = std::getenv("EDEN_NX2_FRAMEGEN");
+        return v == nullptr || v[0] != '0';
+    }();
+    return values.frame_gen.GetValue() && allowed;
 }
 
 size_t FrameGenGenerations() {
