@@ -549,11 +549,21 @@ vk::Buffer MemoryAllocator::CreateBuffer(const VkBufferCreateInfo &ci, MemoryUsa
     if (!CreateBufferInSeparatePool(ci, usage, alloc_ci, handle, allocation, alloc_info)) {
         VkResult result = vmaCreateBuffer(allocator, &ci, &alloc_ci, &handle, &allocation,
                                           &alloc_info);
-        if (result == VK_ERROR_OUT_OF_DEVICE_MEMORY && MemoryPriorityEnabled()) {
-            // Over the budget: past it the driver pages the lowest-priority memory out
-            // (VK_EXT_pageable_device_local_memory) instead of the buffer failing.
-            const VmaAllocationCreateInfo relaxed = WithoutBudgetLimit(alloc_ci);
-            result = vmaCreateBuffer(allocator, &ci, &relaxed, &handle, &allocation, &alloc_info);
+        // Staging buffers live in system memory, where the budget is the OS's soft hint: going
+        // over it pages, refusing aborted the emulator (a texture upload in Ocarina's town
+        // square after 36 minutes). Device-local buffers keep the budget unless
+        // EDEN_NX2_MEM_PRIORITY lets the driver page the lowest-priority memory out
+        // (VK_EXT_pageable_device_local_memory) instead of the buffer failing.
+        const bool out_of_memory =
+            result == VK_ERROR_OUT_OF_DEVICE_MEMORY || result == VK_ERROR_OUT_OF_HOST_MEMORY;
+        if ((out_of_memory && usage != MemoryUsage::DeviceLocal) ||
+            (result == VK_ERROR_OUT_OF_DEVICE_MEMORY && MemoryPriorityEnabled())) {
+            const VmaAllocationCreateInfo over_budget = WithoutBudgetLimit(alloc_ci);
+            result = vmaCreateBuffer(allocator, &ci, &over_budget, &handle, &allocation,
+                                     &alloc_info);
+            LOG_WARNING(Render_Vulkan,
+                        "Buffer of {} KiB (usage {}) over the memory budget: {}", ci.size >> 10,
+                        static_cast<u32>(usage), result == VK_SUCCESS ? "made anyway" : "failed");
         }
         vk::Check(result);
     }

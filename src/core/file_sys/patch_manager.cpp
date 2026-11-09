@@ -71,6 +71,9 @@ struct BuiltinPatch {
     /// When set, the patch applies only with this NVIDIA DLSS mode chosen and is not listed in
     /// Add-Ons.
     std::optional<Settings::OcarinaDlssMode> render_scale{};
+    /// v5.3's A/B switch: this environment variable at 1 skips the patch and at 0 applies it
+    /// even when Add-Ons has it off.
+    const char* ab_env = nullptr;
 };
 
 /// Whether the environment switches of a built-in patch let it apply.
@@ -204,6 +207,7 @@ constexpr std::array BUILTIN_PATCHES{
         .module = "main",
         .build_id = "E0F3CCFAF50065AE4EA01EB5AEB13B1A45DA3348",
         .records = MAX_RESOLUTION_RECORDS,
+        .ab_env = "EDEN_NX2_NO_MAX_RES",
     },
     // Lower render scales under Max Resolution, chosen by Settings ocarina_dlss_mode.
     BuiltinPatch{
@@ -701,7 +705,15 @@ std::vector<u8> PatchManager::PatchNSO(const std::vector<u8>& nso, const std::st
             continue;
 #endif
         }
-        if (std::find(disabled.cbegin(), disabled.cend(), patch.name) != disabled.cend()) {
+        // ab_env=1 skips the patch, =0 applies it even when Add-Ons has it off (A/B runs).
+        const char* const ab_value = patch.ab_env ? std::getenv(patch.ab_env) : nullptr;
+        const std::string_view ab{ab_value ? ab_value : ""};
+        if (ab == "1") {
+            LOG_INFO(Loader, "    - Skipping \"{}\": {}=1", patch.name, patch.ab_env);
+            continue;
+        }
+        if (ab != "0" &&
+            std::find(disabled.cbegin(), disabled.cend(), patch.name) != disabled.cend()) {
             LOG_INFO(Loader, "    - Skipping \"{}\": disabled in Add-Ons", patch.name);
             continue;
         }
