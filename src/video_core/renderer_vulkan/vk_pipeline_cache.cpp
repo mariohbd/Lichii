@@ -4205,7 +4205,12 @@ std::string PipelineCache::KeptStamp(const std::string& prepared_stamp) const {
     // kept pipelines the same is checked at boot on a sample of them (CheckKeptSample).
     // NX2KEPT4: the SPIR-V emitter changed under kept modules (zortos293/Lichii#902 clip
     // distances; #820 noperspective varyings, then its revert), which the sample only sees if it hits one.
-    return fmt::format("{}kept NX2KEPT4 cache {} settings {:#x} gpl {} oot {} {:016x} canonical "
+    // NX2KEPT5: per-tap gathers with dynamic offsets (#433, EDEN_NX2_GATHER_PER_TAP), the native
+    // global memory helpers' OpSwitch (EDEN_NX2_SPIRV_GMEM_SWITCH), and Shader::Info's
+    // frag_color_components (#353, EDEN_NX2_COLOR_MASK_TRIM), which kept infos serialize. With
+    // those switches off the emitter is v5.1's again, but kept files are prepared again under
+    // this stamp either way.
+    return fmt::format("{}kept NX2KEPT5 cache {} settings {:#x} gpl {} oot {} {:016x} canonical "
                        "{}\n",
                        prepared_stamp, CACHE_VERSION, SpirvSettingsStamp(),
                        device.IsExtGraphicsPipelineLibrarySupported() ? 1 : 0,
