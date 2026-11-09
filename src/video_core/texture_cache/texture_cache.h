@@ -15,6 +15,7 @@
 #include <limits>
 #include <map>
 #include <vector>
+#include <tuple>
 #include <optional>
 #include <bit>
 #include <type_traits>
@@ -22,6 +23,7 @@
 #include <boost/container/small_vector.hpp>
 
 #include "common/alignment.h"
+#include "common/cityhash.h"
 #include "common/memory_detect.h"
 #include "common/scope_exit.h"
 #include "common/settings.h"
@@ -427,18 +429,26 @@ void TextureCache<P>::ApplyThresholdOverrides(bool log) {
     if constexpr (requires { runtime.GetDeviceMemoryBudget(); }) {
         max_critical = (std::max)(max_critical, runtime.GetDeviceMemoryBudget() / 8 * 5);
     }
+    // What the device budget allows (budget minus margins), before that cap.
+    const u64 budget_critical = critical_memory;
+    const u64 budget_expected = expected_memory;
     critical_memory = (std::min)(critical_memory, max_critical);
     expected_memory =
         (std::min)(expected_memory, critical_memory - (std::min)(critical_memory, u64{768_MiB}));
     minimum_memory =
         (std::min)(minimum_memory, expected_memory - (std::min)(expected_memory, u64{1_GiB}));
-    // EDEN_NX2_TC_EXPECTED_MIB / EDEN_NX2_TC_CRITICAL_MIB override the collector's thresholds.
-    for (const auto& [name, target] : {std::pair{"EDEN_NX2_TC_EXPECTED_MIB", &expected_memory},
-                                       std::pair{"EDEN_NX2_TC_CRITICAL_MIB", &critical_memory}}) {
+    // EDEN_NX2_TC_EXPECTED_MIB / EDEN_NX2_TC_CRITICAL_MIB raise the collector's thresholds past
+    // the cap above, but never past what the device budget allows: set outright, they kept the
+    // cache above a shrinking budget (other programs' video memory, out-of-memory margins) and
+    // the driver paged (drops to 9 fps on an 8 GB card in Ocarina's Kokiri Forest).
+    for (const auto& [name, target, limit] :
+         {std::tuple{"EDEN_NX2_TC_EXPECTED_MIB", &expected_memory, budget_expected},
+          std::tuple{"EDEN_NX2_TC_CRITICAL_MIB", &critical_memory, budget_critical}}) {
         if (const char* value = std::getenv(name)) {
-            *target = std::strtoull(value, nullptr, 10) << 20;
+            *target = (std::min)(static_cast<u64>(std::strtoull(value, nullptr, 10)) << 20, limit);
         }
     }
+    expected_memory = (std::min)(expected_memory, critical_memory);
     if (log) {
         LOG_INFO(HW_GPU, "Texture cache thresholds: expected {} MiB, critical {} MiB, minimum {} MiB",
                  expected_memory >> 20, critical_memory >> 20, minimum_memory >> 20);
@@ -475,7 +485,7 @@ void TextureCache<P>::TickFrame() {
         // unused. Both thresholds stay under it with a margin (1/8 of it, at most 1 GiB): past it
         // allocations fail and images end up unbacked (garbage textures), and Windows shrinks the
         // budget as the card fills (16 GB card: 13.5 GB left mid-race), hence the re-read every 30
-        // frames. EDEN_NX2_TC_*_MIB overrides still win.
+        // frames. EDEN_NX2_TC_*_MIB overrides can raise the thresholds up to this budget.
         if constexpr (requires { runtime.GetDeviceMemoryBudget(); }) {
             if constexpr (requires { runtime.MemoryPressureEvents(); }) {
                 // Images that did not fit (made in host memory or with nothing bound) mean the
@@ -2580,6 +2590,9 @@ void TextureCache<P>::RefreshContents(Image& image, ImageId image_id) {
         runtime.TransitionImageLayout(image);
         return;
     }
+    if (ContentUnchanged(image)) {
+        return;
+    }
     if (True(image.flags & ImageFlagBits::AsynchronousDecode)) {
         QueueAsyncDecode(image, image_id);
         return;
@@ -2650,6 +2663,44 @@ void TextureCache<P>::RefreshContents(Image& image, ImageId image_id) {
             uploaded_ranges.emplace_back(image.cpu_addr, image.guest_size_bytes);
         }
     }
+}
+
+// A game can write the same data over a texture again: on Pokopia's title, 99.9 % of the images
+// uploaded again were identical, 12 GB in two minutes. Reading the data to hash it costs about what
+// reading it to upload does, so this saves the GPU's copy rather than CPU time, and only pays for
+// images that come back: a first refresh records the hash, one that keeps changing is left alone.
+// EDEN_NX2_TC_SKIP_SAME_UPLOAD=0 (read once) always uploads, as v5.1 did.
+template <class P>
+bool TextureCache<P>::ContentUnchanged(Image& image) {
+    static const bool enabled = [] {
+        const char* v = std::getenv("EDEN_NX2_TC_SKIP_SAME_UPLOAD");
+        return v == nullptr || v[0] != '0';
+    }();
+    if (!enabled) {
+        return false;
+    }
+    static constexpr u32 PatienceChanges = 4;
+    static constexpr u32 RetryRefreshes = 64;
+    static constexpr u64 MaxHashedBytes = 64_MiB; // A hitch of its own past this
+    const u32 refresh = image.content_refreshes++;
+    if (refresh == 0 || image.guest_size_bytes > MaxHashedBytes ||
+        True(image.flags & ImageFlagBits::Sparse) || UploadsByLayer(image) ||
+        (image.content_changes >= PatienceChanges && refresh % RetryRefreshes > 1)) {
+        // What goes up now isn't what was hashed.
+        image.content_hashed = false;
+        return false;
+    }
+    Tegra::Memory::GpuGuestMemory<u8, Tegra::Memory::GuestMemoryFlags::UnsafeRead> guest(
+        *gpu_memory, image.gpu_addr, image.guest_size_bytes, &swizzle_data_buffer);
+    const u64 hash = Common::CityHash64(reinterpret_cast<const char*>(guest.data()), guest.size());
+    // Whatever else wrote to the image on the host, a draw or a copy, moved its tick.
+    const bool same = image.content_hashed && hash == image.content_hash &&
+                      image.modification_tick == image.content_tick;
+    image.content_hashed = true;
+    image.content_hash = hash;
+    image.content_tick = image.modification_tick;
+    image.content_changes = same ? 0 : image.content_changes + 1;
+    return same;
 }
 
 template <class P>
@@ -3935,6 +3986,7 @@ ImageId TextureCache<P>::JoinImages(const ImageInfo& info, GPUVAddr gpu_addr, DA
             const AliasedImage& aliased = new_image.aliased_images[alias_pointer->second];
             CopyImage(new_image_id, aliased.id, aliased.copies);
             new_image.modification_tick = overlap.modification_tick;
+            RaiseAliasTicks(new_image);
             continue;
         }
         if (True(overlap.flags & ImageFlagBits::GpuModified)) {
@@ -3950,6 +4002,7 @@ ImageId TextureCache<P>::JoinImages(const ImageInfo& info, GPUVAddr gpu_addr, DA
                 runtime.CopyImage(new_image, overlap, copies);
             }
             new_image.modification_tick = overlap.modification_tick;
+            RaiseAliasTicks(new_image);
         }
         if (True(overlap.flags & ImageFlagBits::Tracked)) {
             UntrackImage(overlap, copy_object.id);
@@ -4156,8 +4209,26 @@ ImageViewId TextureCache<P>::FindDepthBuffer() {
     if (gpu_addr == 0) {
         return ImageViewId{};
     }
-    const ImageInfo info(regs.zeta, regs.zeta_size, regs.anti_alias_samples_mode);
-    return FindRenderTargetView(info, gpu_addr);
+    ImageInfo info(regs.zeta, regs.zeta_size, regs.anti_alias_samples_mode);
+    // A square depth target with no color target is a shadow map: its size doesn't set the output
+    // resolution, and scaling it only multiplies its memory by the square of the scale (648 MiB for
+    // Ocarina of Time's 12288x12288 sun shadow map at 1.5x). A full-screen depth prepass isn't square.
+    // EDEN_NX2_SHADOW_NATIVE=0 (read once) scales them as v5.1 did.
+    static const bool shadow_native = [] {
+        const char* v = std::getenv("EDEN_NX2_SHADOW_NATIVE");
+        return v == nullptr || v[0] != '0';
+    }();
+    const bool shadow_map =
+        shadow_native && regs.rt_control.count == 0 && info.size.width == info.size.height;
+    if (shadow_map) {
+        info.rescaleable = false;
+    }
+    const ImageViewId view_id = FindRenderTargetView(info, gpu_addr);
+    if (shadow_map && view_id && view_id != NULL_IMAGE_VIEW_ID) {
+        // The image may exist already, made when a texture read it first.
+        slot_images[slot_image_views[view_id].image_id].info.rescaleable = false;
+    }
+    return view_id;
 }
 
 template <class P>
@@ -4871,6 +4942,7 @@ template <class P>
 void TextureCache<P>::MarkModification(ImageBase& image) noexcept {
     image.flags |= ImageFlagBits::GpuModified;
     image.modification_tick = ++modification_tick;
+    RaiseAliasTicks(image);
     image.last_write_frame = RenderFrame();
     if (!clearing_render_targets) {
         image.drawn_since_clear = true;
@@ -5155,9 +5227,26 @@ void TextureCache<P>::TickRelocationTombstones() {
 }
 
 template <class P>
+void TextureCache<P>::RaiseAliasTicks(ImageBase& image) noexcept {
+    for (const AliasedImage& alias : image.aliased_images) {
+        ImageBase& other = slot_images[alias.id];
+        other.newest_alias_tick = (std::max)(other.newest_alias_tick, image.modification_tick);
+    }
+}
+
+template <class P>
 void TextureCache<P>::SynchronizeAliases(ImageId image_id) {
     boost::container::small_vector<const AliasedImage*, 8> aliased_images;
     Image& image = slot_images[image_id];
+    // EDEN_NX2_ALIAS_SYNC_SKIP (read once): nothing aliased was modified after this image, so
+    // skip walking its (possibly long) alias list for every draw that samples it.
+    static const bool alias_sync_skip = [] {
+        const char* v = std::getenv("EDEN_NX2_ALIAS_SYNC_SKIP");
+        return v == nullptr || v[0] != '0';
+    }();
+    if (alias_sync_skip && image.newest_alias_tick <= image.modification_tick) {
+        return;
+    }
     bool any_rescaled = True(image.flags & ImageFlagBits::Rescaled);
     bool any_modified = True(image.flags & ImageFlagBits::GpuModified);
     u64 most_recent_tick = image.modification_tick;
@@ -5182,6 +5271,7 @@ void TextureCache<P>::SynchronizeAliases(ImageId image_id) {
         }
     }
     image.modification_tick = most_recent_tick;
+    RaiseAliasTicks(image);
     if (any_modified) {
         image.flags |= ImageFlagBits::GpuModified;
     }

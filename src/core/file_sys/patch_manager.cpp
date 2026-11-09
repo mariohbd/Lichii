@@ -65,7 +65,27 @@ struct BuiltinPatch {
     /// When set, the patch applies only while this environment variable is 1 (A/B before it
     /// becomes a default).
     const char* enable_env = nullptr;
+    /// When set, the patch is skipped while this environment variable starts with 0 (a default
+    /// that can be turned off).
+    const char* disable_env = nullptr;
 };
+
+/// Whether a built-in patch's environment switches leave it on.
+bool BuiltinPatchSwitchedOn(const BuiltinPatch& patch) {
+    if (patch.enable_env != nullptr) {
+        const char* const value = std::getenv(patch.enable_env);
+        if (value == nullptr || std::string_view{value} != "1") {
+            return false;
+        }
+    }
+    if (patch.disable_env != nullptr) {
+        const char* const value = std::getenv(patch.disable_env);
+        if (value != nullptr && value[0] == '0') {
+            return false;
+        }
+    }
+    return true;
+}
 
 // Ocarina of Time takes its "dynamic resolution disabled" path, so the 3D renders at full scale
 // instead of following the GPU-time controller down to its 480p floor.
@@ -96,6 +116,27 @@ constexpr std::array<u8, 120> DYNAMIC_FPS_ROUTINE{
 constexpr std::array DYNAMIC_FPS_RECORDS{
     BuiltinPatchRecord{.module_offset = 0x6E6CC4, .bytes = DYNAMIC_FPS_CALL},
     BuiltinPatchRecord{.module_offset = 0x3C46200, .bytes = DYNAMIC_FPS_ROUTINE},
+};
+
+// Texture pool for Max Resolution (PantACRO4life e3f36e0ee6, Castle Town pot room freeze #247):
+// with its full-screen targets kept at full size, the game's agl::utl::DynamicTextureAllocator
+// (305 MiB, ~288 usable) runs out where many local shadow maps are near; the game frees the block
+// it got back from the failed Allocate, which corrupts the allocator. Where the allocator is made
+// (stp x8, x9, [sp, #0x10] at main+0xC2A36C, x8 = its size) a branch to the code cave after the
+// Dynamic FPS routine doubles x8 (add x8, x8, x8), stores as before and branches back. Only the
+// guest pool grows: host images follow what is used.
+constexpr std::array<u8, 4> TEXTURE_POOL_BRANCH{0xD5, 0x6F, 0xC0, 0x14}; // b 0x3c462c0
+constexpr std::array<u8, 4> TEXTURE_POOL_DOUBLE{0x08, 0x01, 0x08, 0x8B}; // add x8, x8, x8
+constexpr std::array<u8, 4> TEXTURE_POOL_STORE{0xE8, 0x27, 0x01, 0xA9};  // stp x8, x9, [sp, #0x10]
+constexpr std::array<u8, 4> TEXTURE_POOL_RETURN{0x2A, 0x90, 0x3F, 0x17}; // b 0xc2a370
+constexpr std::array TEXTURE_POOL_RECORDS{
+    BuiltinPatchRecord{.module_offset = 0xC2A36C,
+                       .bytes = TEXTURE_POOL_BRANCH,
+                       .checked = true,
+                       .original = 0xA90127E8}, // stp x8, x9, [sp, #0x10]
+    BuiltinPatchRecord{.module_offset = 0x3C462C0, .bytes = TEXTURE_POOL_DOUBLE, .checked = true, .original = 0},
+    BuiltinPatchRecord{.module_offset = 0x3C462C4, .bytes = TEXTURE_POOL_STORE, .checked = true, .original = 0},
+    BuiltinPatchRecord{.module_offset = 0x3C462C8, .bytes = TEXTURE_POOL_RETURN, .checked = true, .original = 0},
 };
 
 // Occlusion Off (cLohan's community patch, from zortos293/Lichii#641): the game creates no
@@ -135,6 +176,15 @@ constexpr std::array BUILTIN_PATCHES{
         .module = "main",
         .build_id = "E0F3CCFAF50065AE4EA01EB5AEB13B1A45DA3348",
         .records = MAX_RESOLUTION_RECORDS,
+    },
+    // Not tied to Max Resolution's record, so it also holds when that comes from a mod.
+    BuiltinPatch{
+        .name = "Texture pool for Max Resolution (built-in, EDEN_NX2_OOT_TEX_POOL_2X=0 off)",
+        .title_id = 0x0400486024DEC000,
+        .module = "main",
+        .build_id = "E0F3CCFAF50065AE4EA01EB5AEB13B1A45DA3348",
+        .records = TEXTURE_POOL_RECORDS,
+        .disable_env = "EDEN_NX2_OOT_TEX_POOL_2X",
     },
     BuiltinPatch{
         .name = "Dynamic FPS by Dark (built-in)",
@@ -584,11 +634,8 @@ std::vector<u8> PatchManager::PatchNSO(const std::vector<u8>& nso, const std::st
         if (patch.title_id != title_id || patch.module != name) {
             continue;
         }
-        if (patch.enable_env != nullptr) {
-            const char* const value = std::getenv(patch.enable_env);
-            if (value == nullptr || std::string_view{value} != "1") {
-                continue;
-            }
+        if (!BuiltinPatchSwitchedOn(patch)) {
+            continue;
         }
         if (std::find(disabled.cbegin(), disabled.cend(), patch.name) != disabled.cend()) {
             LOG_INFO(Loader, "    - Skipping \"{}\": disabled in Add-Ons", patch.name);
@@ -1200,10 +1247,7 @@ std::vector<Patch> PatchManager::GetPatches(VirtualFile update_raw) const {
     }
 
     for (const auto& patch : BUILTIN_PATCHES) {
-        if (patch.title_id != title_id ||
-            (patch.enable_env != nullptr &&
-             std::string_view{std::getenv(patch.enable_env) ? std::getenv(patch.enable_env) : ""} !=
-                 "1")) {
+        if (patch.title_id != title_id || !BuiltinPatchSwitchedOn(patch)) {
             continue;
         }
         const auto patch_disabled =

@@ -104,9 +104,11 @@ public:
     DescriptorTable<TICEntry, ImageViewId> compute_image_table;
     DescriptorTable<TSCEntry, SamplerId> compute_sampler_table;
 
-    // TODO: still relies on bad iterators :(
-    std::unordered_map<TICEntry, ImageViewId> image_views;
-    std::unordered_map<TSCEntry, SamplerId> samplers;
+    // Flat maps, like the other hot texture cache maps: VisitImageView holds the try_emplace
+    // iterator across CreateImageView, which only erases from image_views (erasing never
+    // rehashes, and never removes the new entry: its id is still 0) and never inserts.
+    ::Common::unordered_map<TICEntry, ImageViewId> image_views;
+    ::Common::unordered_map<TSCEntry, SamplerId> samplers;
 
     TextureCacheGPUMap* gpu_page_table = nullptr;
     TextureCacheGPUMap* sparse_page_table = nullptr;
@@ -183,6 +185,9 @@ class TextureCache : public VideoCommon::ChannelSetupCaches<TextureCacheChannelI
 
     /// Splits large 2D image uploads into smaller chunks, avoiding multi-hundred MiB staging buffers.
     bool UploadInChunks(Image& image);
+
+    /// Whether the guest data of an image about to be uploaded again is what it already holds.
+    [[nodiscard]] bool ContentUnchanged(Image& image);
 
     /// Large layered images whose refresh can decode only the layers written since the last one.
     [[nodiscard]] bool UploadsByLayer(const ImageBase& image) const noexcept;
@@ -757,6 +762,9 @@ private:
 
     /// Mark an image as modified from the GPU
     void MarkModification(ImageBase& image) noexcept;
+
+    /// Raises the newest_alias_tick of image's aliases to its modification_tick.
+    void RaiseAliasTicks(ImageBase& image) noexcept;
 
     /// Synchronize image aliases, copying data if needed
     void SynchronizeAliases(ImageId image_id);
