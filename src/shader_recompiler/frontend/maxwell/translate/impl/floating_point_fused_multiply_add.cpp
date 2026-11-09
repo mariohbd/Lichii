@@ -4,6 +4,7 @@
 #include "common/common_types.h"
 #include "shader_recompiler/exception.h"
 #include "shader_recompiler/frontend/maxwell/translate/impl/common_encoding.h"
+#include "shader_recompiler/frontend/maxwell/translate/impl/fmz_before_sat.h"
 #include "shader_recompiler/frontend/maxwell/translate/impl/impl.h"
 
 namespace Shader::Maxwell {
@@ -28,7 +29,7 @@ void FFMA(TranslatorVisitor& v, u64 insn, const IR::F32& src_b, const IR::F32& s
         .fmz_mode = CastFmzMode(fmz_mode),
     };
     IR::F32 value{v.ir.FPFma(op_a, op_b, op_c, fp_control)};
-    if (fmz_mode == FmzMode::FMZ) {
+    if (fmz_mode == FmzMode::FMZ && (FmzBeforeSat() || !sat)) {
         // On D3D9 mode, anything * 0 is zero, even NAN and infinity, so the result is the addend.
         // SAT doesn't make this redundant: it turns the NaN of 0 * Inf + c into 0, not sat(c).
         const IR::F32 zero{v.ir.Imm32(0.0f)};

@@ -44,6 +44,7 @@
 #include "shader_recompiler/environment.h"
 #include "shader_recompiler/exception.h"
 #include "shader_recompiler/frontend/maxwell/control_flow.h"
+#include "shader_recompiler/frontend/maxwell/translate/impl/fmz_before_sat.h"
 #include "shader_recompiler/frontend/maxwell/translate_program.h"
 #include "shader_recompiler/info_serialize.h"
 #include "shader_recompiler/translate_profile.h"
@@ -4204,12 +4205,14 @@ std::string PipelineCache::KeptStamp(const std::string& prepared_stamp) const {
     // kept pipelines the same is checked at boot on a sample of them (CheckKeptSample).
     // NX2KEPT4: the SPIR-V emitter changed under kept modules (zortos293/Lichii#902 clip
     // distances; #820 noperspective varyings, then its revert), which the sample only sees if it hits one.
+    // fmz: EDEN_NX2_FMZ_BEFORE_SAT changes the SPIR-V of FFMA/HFMA2 .FMZ.SAT (Lichii#811), so
+    // the kept modules are translated again when it is toggled.
     return fmt::format("{}kept NX2KEPT4 cache {} settings {:#x} gpl {} oot {} {:016x} canonical "
-                       "{}\n",
+                       "{} fmz {}\n",
                        prepared_stamp, CACHE_VERSION, SpirvSettingsStamp(),
                        device.IsExtGraphicsPipelineLibrarySupported() ? 1 : 0,
                        oot_visual_workaround ? 1 : 0, visual_workaround_title,
-                       CanonicalKeys() ? 1 : 0);
+                       CanonicalKeys() ? 1 : 0, Shader::Maxwell::FmzBeforeSat() ? 1 : 0);
 }
 
 std::shared_ptr<const PrecompiledKept::Index> PipelineCache::KeptIndex() const {

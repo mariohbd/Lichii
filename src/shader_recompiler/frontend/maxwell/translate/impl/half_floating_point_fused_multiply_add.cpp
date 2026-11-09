@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2021 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include "shader_recompiler/frontend/maxwell/translate/impl/fmz_before_sat.h"
 #include "shader_recompiler/frontend/maxwell/translate/impl/half_floating_point_helper.h"
 
 namespace Shader::Maxwell {
@@ -46,7 +47,7 @@ void HFMA2(TranslatorVisitor& v, u64 insn, Merge merge, Swizzle swizzle_a, bool 
     };
     IR::F16F32F64 lhs{v.ir.FPFma(lhs_a, lhs_b, lhs_c, fp_control)};
     IR::F16F32F64 rhs{v.ir.FPFma(rhs_a, rhs_b, rhs_c, fp_control)};
-    if (precision == HalfPrecision::FMZ) {
+    if (precision == HalfPrecision::FMZ && (FmzBeforeSat() || !sat)) {
         // On D3D9 mode, anything * 0 is zero, even NAN and infinity, so the result is the addend.
         // SAT doesn't make this redundant: it turns the NaN of 0 * Inf + c into 0, not sat(c).
         lhs = SelectFmzProduct(v.ir, lhs_a, lhs_b, lhs_c, lhs);

@@ -101,6 +101,7 @@ add_library(shader_recompiler STATIC
     frontend/maxwell/translate/impl/floating_point_conversion_floating_point.cpp
     frontend/maxwell/translate/impl/floating_point_conversion_integer.cpp
     frontend/maxwell/translate/impl/floating_point_fused_multiply_add.cpp
+    frontend/maxwell/translate/impl/fmz_before_sat.h
     frontend/maxwell/translate/impl/floating_point_min_max.cpp
     frontend/maxwell/translate/impl/floating_point_multi_function.cpp
     frontend/maxwell/translate/impl/floating_point_multiply.cpp
