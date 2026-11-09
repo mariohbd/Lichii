@@ -3909,14 +3909,25 @@ ImageId TextureCache<P>::JoinImages(const ImageInfo& info, GPUVAddr gpu_addr, DA
     // first, or the upload would overwrite the copies. Alias copies can wait (the resolve runs
     // them with the upload); overlaps merged into the image can't, they get deleted. Replaces
     // overwritten_by_clear's skip, which needed no copies at all.
+    // EDEN_NX2_RSMAN_VRAM_OVER_GPU (zortos293/Lichii#267): a new render target over memory whose
+    // last contents only the GPU has (a GPU-written bad overlap) skips the upload: the guest
+    // bytes are stale, and a target newly placed in that memory has no defined contents anyway.
+    // Ocarina of Time places about 45 targets a frame at new addresses while the camera moves.
+    static const bool over_gpu_skip = RsManVram::Enabled("EDEN_NX2_RSMAN_VRAM_OVER_GPU");
+    const bool over_gpu_contents =
+        over_gpu_skip && inserting_render_target && join_copies_to_do.empty() &&
+        std::ranges::any_of(join_bad_overlap_ids, [this](ImageId overlap_id) {
+            return True(slot_images[overlap_id].flags & ImageFlagBits::GpuModified);
+        });
     const bool deferred_refresh =
-        defer_rt_refresh && std::ranges::all_of(join_copies_to_do, [](const JoinCopy& copy) {
+        !over_gpu_contents && defer_rt_refresh &&
+        std::ranges::all_of(join_copies_to_do, [](const JoinCopy& copy) {
             return copy.is_alias;
         });
     static const bool rt_defer = RsManVram::Enabled("EDEN_NX2_RSMAN_VRAM_RT_DEFER");
-    const bool clear_skip = !rt_defer && overwritten_by_clear();
+    const bool clear_skip = !over_gpu_contents && !rt_defer && overwritten_by_clear();
     // EDEN_NX2_EXP8 bit 2: skip the upload the copies overwrite.
-    const bool copy_skip = !clear_skip && !deferred_refresh &&
+    const bool copy_skip = !over_gpu_contents && !clear_skip && !deferred_refresh &&
                            (VideoCore::Nx2Debug::Experiment(8) & 2) != 0 &&
                            overwritten_by_copies();
     if (VideoCore::Nx2Debug::Experiment(7) != 0 && new_image.guest_size_bytes >= 4_MiB)
@@ -3940,14 +3951,21 @@ ImageId TextureCache<P>::JoinImages(const ImageInfo& info, GPUVAddr gpu_addr, DA
                         new_info.resources.layers, new_image.gpu_addr, join_copies_to_do.size(),
                         aliases, gpu_written, join_bad_overlap_ids.size(),
                         clearing_render_targets, overwritten_by_copies(),
-                        clear_skip         ? "skipped (clear)"
+                        over_gpu_contents  ? "skipped (over GPU contents)"
+                        : clear_skip       ? "skipped (clear)"
                         : deferred_refresh ? "deferred (clear)"
                         : copy_skip        ? "skipped (copies)"
                                            : "done");
         }
     }
     const auto refresh_start = std::chrono::steady_clock::now();
-    if (deferred_refresh) {
+    if (over_gpu_contents) {
+        new_image.flags &= ~ImageFlagBits::CpuModified;
+        if (False(new_image.flags & ImageFlagBits::Tracked)) {
+            TrackImage(new_image, new_image_id);
+        }
+        runtime.TransitionImageLayout(new_image);
+    } else if (deferred_refresh) {
         deferred_rt_refreshes.push_back(new_image_id);
         runtime.TransitionImageLayout(new_image);
     } else if (clear_skip) {
@@ -3965,7 +3983,8 @@ ImageId TextureCache<P>::JoinImages(const ImageInfo& info, GPUVAddr gpu_addr, DA
     }
     rt_stats.refresh_ns += NsSince(refresh_start);
     if (!relocation_tombstones.empty()) {
-        CheckTombstoneCreation(new_image_id, new_image, clear_skip); // EXP43=4
+        // EXP43=4
+        CheckTombstoneCreation(new_image_id, new_image, clear_skip || over_gpu_contents);
     }
 
     if (can_rescale) {
@@ -4287,7 +4306,9 @@ ImageViewId TextureCache<P>::FindRenderTargetView(const ImageInfo& info, GPUVAdd
     bool delete_state = has_deleted_images;
     do {
         has_deleted_images = false;
+        inserting_render_target = true;
         image_id = FindOrInsertImage(info, gpu_addr);
+        inserting_render_target = false;
         delete_state |= has_deleted_images;
     } while (has_deleted_images);
     has_deleted_images = delete_state;

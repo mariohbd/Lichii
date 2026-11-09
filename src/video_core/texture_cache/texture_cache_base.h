@@ -897,6 +897,8 @@ private:
     /// new target's upload to ResolveDeferredRtRefreshes, which skips it when the clear overwrites it.
     bool defer_rt_refresh = false;
     std::vector<ImageId> deferred_rt_refreshes;
+    /// FindRenderTargetView is looking for its image (EDEN_NX2_RSMAN_VRAM_OVER_GPU).
+    bool inserting_render_target = false;
     bool is_rescaling = false;
     u64 total_used_memory = 0;
     u64 minimum_memory;
