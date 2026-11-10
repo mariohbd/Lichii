@@ -244,6 +244,12 @@ bool NanGuardShader(u64 hash) {
     return all || std::ranges::find(hashes, hash) != hashes.end();
 }
 
+/// The EDEN_NX2_NAN_GUARD value as the kept pipeline stamp sees it ("off" when unset).
+std::string NanGuardStamp() {
+    const char* const value = std::getenv("EDEN_NX2_NAN_GUARD");
+    return value != nullptr && value[0] != '\0' ? std::string{value} : std::string{"off"};
+}
+
 Shader::RuntimeInfo MakeRuntimeInfo(std::span<const Shader::IR::Program> programs,
                                     const GraphicsPipelineCacheKey& key,
                                     const Shader::IR::Program& program,
@@ -4274,12 +4280,15 @@ std::string PipelineCache::KeptStamp(const std::string& prepared_stamp) const {
     // distances; #820 noperspective varyings, then its revert), which the sample only sees if it hits one.
     // fmz: EDEN_NX2_FMZ_BEFORE_SAT changes the SPIR-V of FFMA/HFMA2 .FMZ.SAT (Lichii#811), so
     // the kept modules are translated again when it is toggled.
+    // nanguard: EDEN_NX2_NAN_GUARD changes fragment SPIR-V (PantACRO4life test/nan-guard,
+    // Lichii#867), so kept modules built without it would keep writing NaN.
     return fmt::format("{}kept NX2KEPT4 cache {} settings {:#x} gpl {} oot {} {:016x} canonical "
-                       "{} fmz {}\n",
+                       "{} fmz {} nanguard {}\n",
                        prepared_stamp, CACHE_VERSION, SpirvSettingsStamp(),
                        device.IsExtGraphicsPipelineLibrarySupported() ? 1 : 0,
                        oot_visual_workaround ? 1 : 0, visual_workaround_title,
-                       CanonicalKeys() ? 1 : 0, Shader::Maxwell::FmzBeforeSat() ? 1 : 0);
+                       CanonicalKeys() ? 1 : 0, Shader::Maxwell::FmzBeforeSat() ? 1 : 0,
+                       NanGuardStamp());
 }
 
 std::shared_ptr<const PrecompiledKept::Index> PipelineCache::KeptIndex() const {
